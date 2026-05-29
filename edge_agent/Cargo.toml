@@ -1,0 +1,24 @@
+[package]
+name = "edge_agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zip = "0.6"
+libc = "0.2"
+
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.21"
+aes-gcm = "0.10"
+rand = "0.8"
+tempfile = "3.6"
+anyhow = "1.0"
+hostname = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+tungstenite = { version = "0.21", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+ctrlc = "3.4"
