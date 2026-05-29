@@ -863,7 +863,25 @@ fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
 
 // ─── Main Entry Point ──────────────────────────────────────────────────────
 
+fn load_env_file(path: &str) {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            env::set_var(key.trim(), value.trim());
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    load_env_file("/etc/tenxo/agent.env");
+
     let matchmaker_url =
         env::var("MATCHMAKER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let node_id = env::var("NODE_ID").unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
