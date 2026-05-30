@@ -9,8 +9,8 @@
 //! Reference: AMD SEV-SNP Firmware ABI Specification, Rev 1.55
 //!            Linux kernel drivers/virt/coco/sev-guest/
 
-use base64::engine::general_purpose;
 use base64::Engine;
+use base64::engine::general_purpose;
 use sha2::{Digest, Sha256};
 
 use x25519_dalek::PublicKey;
@@ -19,7 +19,10 @@ use crate::TeeQuote;
 
 // ─── Public API ─────────────────────────────────────────────────────
 
-pub fn generate_tee_quote(agent_pubkey: &PublicKey, challenge_nonce: &[u8; 32]) -> TeeQuote {
+pub fn generate_tee_quote(
+    agent_pubkey: &PublicKey,
+    challenge_nonce: &[u8; 32],
+) -> TeeQuote {
     let pubkey_raw = agent_pubkey.as_bytes();
     let pubkey_hash = Sha256::digest(pubkey_raw);
 
@@ -37,8 +40,9 @@ pub fn generate_tee_quote(agent_pubkey: &PublicKey, challenge_nonce: &[u8; 32]) 
         report_data_b64: general_purpose::STANDARD.encode(report_data),
         measurement_b64: general_purpose::STANDARD.encode(measurement),
         chip_id_b64: general_purpose::STANDARD.encode(chip_id),
-        signature_b64: general_purpose::STANDARD
-            .encode(b"ECDSA-SECP384R1-SOFTWARE-FALLBACK-SIGNATURE-FOR-DEV-MODE-PRODUCTION-ONLY"),
+        signature_b64: general_purpose::STANDARD.encode(
+            b"ECDSA-SECP384R1-SOFTWARE-FALLBACK-SIGNATURE-FOR-DEV-MODE-PRODUCTION-ONLY",
+        ),
         cert_chain_b64: vec![
             general_purpose::STANDARD.encode(b"MILAN-ARK-CERT-DEV-FALLBACK"),
             general_purpose::STANDARD.encode(b"MILAN-ASK-CERT-DEV-FALLBACK"),
