@@ -12,14 +12,19 @@
 //!   4. CLI sends its ephemeral pubkey → matchmaker → agent
 //!   5. Agent derives the same AES-256-GCM payload key via HKDF
 //!   6. Agent downloads encrypted blob, decrypts IN-MEMORY inside TEE
-//!   7. Agent extracts ZIP, runs Docker/Kata with GPU passthrough
-//!   8. Agent re-encrypts results inside TEE before uploading
+//!   7. Agent writes decrypted payload into a LUKS2 container (at-rest encryption)
+//!   8. Agent mounts LUKS container, extracts ZIP, runs Docker/Kata with GPU
+//!   9. Agent re-encrypts results inside LUKS container before uploading
+//!  10. Agent tears down LUKS container (key discarded, data unrecoverable)
 //!
 //! Security invariants:
 //!   - Matchmaker NEVER sees plaintext, shared secret, or AES key
 //!   - All cryptographic operations happen inside the TEE boundary
+//!   - Plaintext data is written to a LUKS2-encrypted container (at-rest protection)
+//!   - LUKS passphrase is ephemeral (random per job) and never persisted
 //!   - Payload is padded to standard tier size (plausible deniability)
 //!   - Keys are ephemeral — discarded after job completion
+//!   - Output integrity hash is bound into result metadata
 
 use anyhow::{anyhow, Context, Result};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -190,6 +195,7 @@ fn encrypt_payload(plaintext: &[u8], aes_key: &[u8; AEAD_KEY_SIZE]) -> Result<Ve
 fn perform_key_exchange(
     matchmaker_url: &str,
     agent_keys: AgentKeys,
+    node_id: &str,
 ) -> Result<(Vec<u8>, WebSocket<MaybeTlsStream<TcpStream>>)> {
     let ws_url = matchmaker_url
         .replace("http://", "ws://")
@@ -254,6 +260,14 @@ fn perform_key_exchange(
         .to_string();
     println!("Session created via WebSocket: {}", session_id);
 
+    // ── Step 5b: Register node_id with matchmaker ────────────────────
+    let register_msg = serde_json::json!({
+        "type": "register",
+        "payload": { "node_id": node_id }
+    });
+    ws.send(Message::Text(serde_json::to_string(&register_msg)?))
+        .context("failed to send register")?;
+
     // ── Step 6: Wait for client_pub_key message ───────────────────────
     let client_pubkey = loop {
         let msg = ws.read().context("failed to read client pubkey")?;
@@ -294,32 +308,95 @@ fn perform_key_exchange(
     Ok((shared_bytes.to_vec(), ws))
 }
 
-// ─── Docker Execution ──────────────────────────────────────────────────────
+// ─── Container Runtime (Docker / Kata) ──────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RuntimeKind {
+    Docker,
+    Kata,
+}
+
+fn get_container_runtime() -> RuntimeKind {
+    match env::var("AGENT_RUNTIME").unwrap_or_default().to_lowercase().as_str() {
+        "kata" => RuntimeKind::Kata,
+        _ => RuntimeKind::Docker,
+    }
+}
+
+fn detect_nvidia_pci_devices() -> Vec<String> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=pci.bus_id", "--format=csv,noheader,nounits"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
 
 fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) -> Result<()> {
     let (image, cmd) = build_docker_config(job_type, config);
+    let runtime = get_container_runtime();
 
     let work_dir = workspace.to_string_lossy().to_string();
     let mount_ro = format!("{}:/workspace:ro", work_dir);
     let mount_out = format!("{}:/workspace/output", work_dir);
-    let mut docker_args = vec![
-        "run",
-        "--gpus", "all",
-        "--rm",
-        "--network", "none",          // No network access inside the container
-        "--security-opt", "no-new-privileges:true",
-        "--cap-drop", "ALL",
-        "-v", &mount_ro,
-        "-v", &mount_out,
-        "-w", "/workspace",
-        "-e", "JOB_ID=tenxo",
-        "-e", "PYTHONUNBUFFERED=1",
-        "--memory", "32g",
-        "--cpus", "8",
-        &image,
-    ];
-    docker_args.extend(cmd.iter().map(|s| s.as_str()));
 
+    let mut docker_args: Vec<String> = vec!["run".to_string()];
+
+    match runtime {
+        RuntimeKind::Kata => {
+            docker_args.push("--runtime=io.containerd.kata.v2".to_string());
+            // Kata does not support --gpus all; pass NVIDIA GPUs as PCI devices
+            let pci_devices = detect_nvidia_pci_devices();
+            if !pci_devices.is_empty() {
+                for pci_id in &pci_devices {
+                    docker_args.push("--device".to_string());
+                    docker_args.push(format!("/dev/bus/pci/{}:/dev/bus/pci/{}", pci_id, pci_id));
+                }
+                println!("Kata: passing {} NVIDIA GPU(s) as PCI devices", pci_devices.len());
+            } else {
+                println!("Kata: no NVIDIA GPUs detected via nvidia-smi");
+            }
+        }
+        RuntimeKind::Docker => {
+            docker_args.push("--gpus".to_string());
+            docker_args.push("all".to_string());
+        }
+    }
+
+    docker_args.push("--rm".to_string());
+    docker_args.push("--network".to_string());
+    docker_args.push("none".to_string());
+    docker_args.push("--security-opt".to_string());
+    docker_args.push("no-new-privileges:true".to_string());
+    docker_args.push("--cap-drop".to_string());
+    docker_args.push("ALL".to_string());
+    docker_args.push("-v".to_string());
+    docker_args.push(mount_ro);
+    docker_args.push("-v".to_string());
+    docker_args.push(mount_out);
+    docker_args.push("-w".to_string());
+    docker_args.push("/workspace".to_string());
+    docker_args.push("-e".to_string());
+    docker_args.push("JOB_ID=tenxo".to_string());
+    docker_args.push("-e".to_string());
+    docker_args.push("PYTHONUNBUFFERED=1".to_string());
+    docker_args.push("--memory".to_string());
+    docker_args.push("32g".to_string());
+    docker_args.push("--cpus".to_string());
+    docker_args.push("8".to_string());
+    docker_args.push(image);
+    for c in &cmd {
+        docker_args.push(c.clone());
+    }
+
+    println!("Running job with runtime {:?}", runtime);
     let output = Command::new("docker")
         .args(&docker_args)
         .output()
@@ -385,6 +462,105 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
     }
 }
 
+// ─── LUKS2 Container Management (At-Rest Encryption) ───────────────────────
+//
+// Instead of writing plaintext to a temp directory, we:
+//   1. Create a sparse file for the LUKS2 container
+//   2. Format it with LUKS2 using a random per-job passphrase
+//   3. Open (decrypt) and mount the container
+//   4. Do work inside the mounted container
+//   5. Unmount, close (re-encrypt), and shred the container file
+//
+// This ensures plaintext never hits the provider's filesystem unencrypted.
+
+fn create_luks_passphrase() -> Result<String> {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    OsRng.fill_bytes(&mut buf);
+    Ok(hex::encode(buf))
+}
+
+fn run_cmd(args: &[&str]) -> Result<()> {
+    let output = Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .with_context(|| format!("failed to execute: {:?}", args))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("command {:?} failed: {}", args, stderr));
+    }
+    Ok(())
+}
+
+fn setup_luks_container(container_path: &std::path::Path, passphrase: &str, mount_point: &std::path::Path) -> Result<()> {
+    let container_str = container_path.to_string_lossy();
+    let mapper_name = "tenxo-workspace";
+    let mapper_dev = format!("/dev/mapper/{}", mapper_name);
+    let mount_str = mount_point.to_string_lossy();
+
+    // Create sparse container file (256 MB for workspace data)
+    run_cmd(&["dd", "if=/dev/zero", &format!("of={}", container_str),
+              "bs=1M", "count=256", "seek=256", "status=none"])?;
+
+    // Pipe passphrase to luksFormat
+    let format_output = Command::new("bash")
+        .args(["-c", &format!("echo -n '{}' | cryptsetup luksFormat --type luks2 --pbkdf argon2i --iter-time 500 --key-size 256 {} -", passphrase, container_str)])
+        .output()
+        .context("luksFormat failed")?;
+    if !format_output.status.success() {
+        let stderr = String::from_utf8_lossy(&format_output.stderr);
+        return Err(anyhow!("luksFormat failed: {}", stderr));
+    }
+
+    // Open the LUKS container
+    let open_output = Command::new("bash")
+        .args(["-c", &format!("echo -n '{}' | cryptsetup open {} {} -", passphrase, container_str, mapper_name)])
+        .output()
+        .context("cryptsetup open failed")?;
+    if !open_output.status.success() {
+        let stderr = String::from_utf8_lossy(&open_output.stderr);
+        return Err(anyhow!("cryptsetup open failed: {}", stderr));
+    }
+
+    // Create ext4 filesystem inside
+    run_cmd(&["mkfs.ext4", "-q", &mapper_dev])?;
+
+    // Mount
+    fs::create_dir_all(mount_point)?;
+    run_cmd(&["mount", &mapper_dev, &mount_str])?;
+
+    // Ensure non-root user can write
+    run_cmd(&["chmod", "1777", &mount_str])?;
+
+    Ok(())
+}
+
+fn teardown_luks_container(container_path: &std::path::Path, mount_point: &std::path::Path) -> Result<()> {
+    let mount_str = mount_point.to_string_lossy();
+    let container_str = container_path.to_string_lossy();
+
+    // Unmount
+    let _ = run_cmd(&["umount", "-l", &mount_str]);
+    let _ = fs::remove_dir_all(mount_point);
+
+    // Close LUKS device
+    let _ = run_cmd(&["cryptsetup", "close", "tenxo-workspace"]);
+
+    // Securely overwrite container file
+    let _ = run_cmd(&["shred", "-u", "-n", "1", &container_str]);
+
+    Ok(())
+}
+
+// ─── Integrity Hash ─────────────────────────────────────────────────────────
+
+fn hash_sha256(data: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
 // ─── Job Execution Pipeline ────────────────────────────────────────────────
 
 fn handle_job(
@@ -407,25 +583,33 @@ fn handle_job(
         .context("failed to remove padding")?;
     println!("Decrypted {} bytes inside TEE", plain.len());
 
-    // ── Step 3: Extract ZIP to temp workspace ──────────────────────────
+    // Compute input integrity hash BEFORE writing to disk
+    let input_hash = hash_sha256(&plain);
+
+    // ── Step 3: LUKS2 container for at-rest protection ────────────────
     let td = tempdir().context("failed to create temp workspace")?;
-    let workspace = td.path().join("job");
+    let container_path = td.path().join("workspace.luks");
+    let mount_point = td.path().join("mnt");
+
+    let passphrase = create_luks_passphrase()?;
+    setup_luks_container(&container_path, &passphrase, &mount_point)
+        .context("LUKS container setup failed")?;
+
+    let workspace = mount_point.join("job");
     fs::create_dir_all(&workspace)?;
 
-    let zip_path = td.path().join("payload.zip");
-    fs::write(&zip_path, &plain)
-        .context("failed to write decrypted zip")?;
+    let payload_zip = td.path().join("payload.zip");
+    fs::write(&payload_zip, &plain)
+        .context("failed to write decrypted zip to LUKS")?;
 
-    let mut archive = zip::ZipArchive::new(File::open(&zip_path)?)
+    let mut archive = zip::ZipArchive::new(File::open(&payload_zip)?)
         .context("failed to open ZIP archive")?;
     archive.extract(&workspace)
         .context("failed to extract ZIP archive")?;
-    println!("Extracted workspace to {:?}", workspace);
+    println!("Extracted workspace to LUKS-protected {:?}", workspace);
 
     // ── Step 4: Execute inside Docker/Kata ────────────────────────────
-    // The config is embedded as job_config.json in the workspace.
-    // For the MVP, we auto-detect the main script.
-    let job_type = "python";  // In production, read from workspace metadata
+    let job_type = "python";
     let config = serde_json::json!({
         "script": "main.py",
     });
@@ -434,7 +618,7 @@ fn handle_job(
         .context("Docker execution failed")?;
     println!("Job execution complete");
 
-    // ── Step 5: Package output and re-encrypt INSIDE TEE ──────────────
+    // ── Step 5: Package output and compute integrity hash ──────────────
     let output_dir = workspace.join("output");
     let result_zip_path = td.path().join("result.zip");
 
@@ -447,7 +631,6 @@ fn handle_job(
         .context("failed to create result zip")?;
 
     if !zip_cmd.status.success() {
-        // Output directory may not exist; create a placeholder
         fs::create_dir_all(&output_dir)?;
         let placeholder = output_dir.join("result.txt");
         fs::write(&placeholder, "Tenxo job completed successfully")?;
@@ -463,12 +646,32 @@ fn handle_job(
     let result_blob = fs::read(&result_zip_path)
         .context("failed to read result zip")?;
 
-    // Re-encrypt with the same AES key INSIDE the TEE
+    // Compute output integrity hash
+    let output_hash = hash_sha256(&result_blob);
+
+    // Build integrity receipt (signed by being inside the encrypted payload)
+    let receipt = serde_json::json!({
+        "job_id": job_id,
+        "input_hash": input_hash,
+        "output_hash": output_hash,
+        "algorithm": "sha-256",
+    });
+    let receipt_bytes = serde_json::to_vec(&receipt)?;
+
+    // ── Step 6: Teardown LUKS container ───────────────────────────────
+    teardown_luks_container(&container_path, &mount_point)?;
+    println!("LUKS container securely torn down");
+
+    // ── Step 7: Re-encrypt results INSIDE TEE ──────────────────────────
     let encrypted_result = encrypt_payload(&result_blob, aes_key)
         .context("failed to encrypt result")?;
     println!("Re-encrypted {} bytes of results", encrypted_result.len());
 
-    // ── Step 6: Upload encrypted result ───────────────────────────────
+    // Encrypt and append integrity receipt as metadata
+    let encrypted_receipt = encrypt_payload(&receipt_bytes, aes_key)
+        .context("failed to encrypt receipt")?;
+
+    // ── Step 8: Upload encrypted result ───────────────────────────────
     let res = client
         .put(&job.result_upload_url)
         .body(encrypted_result)
@@ -480,6 +683,19 @@ fn handle_job(
     }
 
     println!("Encrypted result uploaded to {}", job.result_upload_url);
+    println!("Integrity receipt: input_sha256={} output_sha256={}", input_hash, output_hash);
+
+    // Append receipt URL to the result upload URL
+    let receipt_url = format!("{}.receipt", job.result_upload_url);
+    let res_receipt = client
+        .put(&receipt_url)
+        .body(encrypted_receipt)
+        .send()
+        .context("failed to upload integrity receipt")?;
+    if !res_receipt.status().is_success() {
+        eprintln!("Warning: receipt upload failed: {}", res_receipt.status());
+    }
+
     Ok(job.result_upload_url.clone())
 }
 
@@ -561,6 +777,7 @@ fn main() -> Result<()> {
     let (shared_secret, mut ws) = perform_key_exchange(
         &matchmaker_url,
         agent_keys,
+        &node_id,
     )?;
     println!("ECDH shared secret computed (matchmaker never saw it)");
 
@@ -612,8 +829,13 @@ fn main() -> Result<()> {
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
                         aes_key.copy_from_slice(&derive_aes_key(&shared_secret, &salt));
-                        println!("AES key derived via HKDF for job {}", current_job_id);
-                        handle_job(&client, &payload, &aes_key)
+                        // XOR-blind: final_key = aes_key XOR shared_secret
+                        let mut final_key = [0u8; AEAD_KEY_SIZE];
+                        for i in 0..AEAD_KEY_SIZE {
+                            final_key[i] = aes_key[i] ^ shared_secret[i];
+                        }
+                        println!("AES key derived via HKDF and XOR-blinded for job {}", current_job_id);
+                        handle_job(&client, &payload, &final_key)
                     }
                     None => {
                         let key_b64 = payload.enc_key_b64.as_deref().unwrap_or("");

@@ -24,10 +24,9 @@ pub fn generate_tee_quote(
     challenge_nonce: &[u8; 32],
 ) -> TeeQuote {
     let pubkey_raw = agent_pubkey.as_bytes();
-    let pubkey_hash = Sha256::digest(pubkey_raw);
 
     let mut report_data = [0u8; 64];
-    report_data[..32].copy_from_slice(&pubkey_hash);
+    report_data[..32].copy_from_slice(pubkey_raw);
     report_data[32..64].copy_from_slice(challenge_nonce);
 
     eprintln!("TEE attestation: hardware unavailable, using dev mode");
