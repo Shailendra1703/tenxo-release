@@ -723,30 +723,23 @@ fn main() -> Result<()> {
         env::var("NODE_ID").unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
     let owner = env::var("OWNER").unwrap_or_else(|_| String::new());
 
-    println!("Tenxo Edge Agent starting...");
-    println!("  Node ID:    {}", node_id);
-    println!("  Matchmaker: {}", matchmaker_url);
-    println!("  Owner:      {}", if owner.is_empty() { "(none)" } else { &owner });
-
-    // ── Query GPU info early (before key exchange) ─────────────────
     let (gpu_model, gpu_vram_mb) = query_gpu_info();
     println!("Detected GPU: {} ({} MB VRAM)", gpu_model, gpu_vram_mb);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    ctrlc::set_handler(move || {
+        println!("\nReceived shutdown signal, cleaning up...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    })
+    .context("failed to set Ctrl-C handler")?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(3600))
         .build()
         .context("failed to create HTTP client")?;
 
-    // ── Shutdown flag ──────────────────────────────────────────────
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    ctrlc::set_handler(move || {
-        println!("Received shutdown signal, cleaning up...");
-        shutdown_clone.store(true, Ordering::SeqCst);
-    })
-    .context("failed to set Ctrl-C handler")?;
-
-    // ── Spawn heartbeat publisher immediately (HTTP POST) ──────────
+    // ── Spawn heartbeat publisher (HTTP POST, runs across reconnects) ──
     let hb_client = client.clone();
     let hb_url = format!("{}/agent/heartbeat", matchmaker_url);
     let hb_node = node_id.clone();
@@ -769,19 +762,58 @@ fn main() -> Result<()> {
         }
     });
 
-    // ── Generate ephemeral X25519 keypair ────────────────────────────
+    // ── Retry loop: reconnect on WS drop ──────────────────────────────
+    let mut backoff: u64 = 1;
+    while !shutdown.load(Ordering::SeqCst) {
+        println!("Tenxo Edge Agent connecting...");
+        println!("  Node ID:    {}", node_id);
+        println!("  Matchmaker: {}", matchmaker_url);
+        println!("  Owner:      {}", if owner.is_empty() { "(none)" } else { &owner });
+
+        match run_agent(&matchmaker_url, &node_id, &owner, &gpu_model, gpu_vram_mb, &client, &shutdown) {
+            Ok(_) => {
+                println!("Agent session ended normally");
+                break;
+            }
+            Err(e) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                eprintln!("Agent error: {}. Reconnecting in {}s...", e, backoff);
+                for _ in 0..backoff {
+                    if shutdown.load(Ordering::SeqCst) { break; }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                if backoff < 30 {
+                    backoff += 2;
+                }
+            }
+        }
+    }
+
+    println!("Agent shutting down gracefully");
+    Ok(())
+}
+
+fn run_agent(
+    matchmaker_url: &str,
+    node_id: &str,
+    owner: &str,
+    gpu_model: &str,
+    gpu_vram_mb: i32,
+    client: &Client,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<()> {
     let agent_keys = AgentKeys::generate();
     println!("Ephemeral X25519 keypair generated");
 
-    // ── ECDH Key Exchange + acquire persistent WebSocket bridge ──────
     let (shared_secret, mut ws) = perform_key_exchange(
-        &matchmaker_url,
+        matchmaker_url,
         agent_keys,
-        &node_id,
+        node_id,
     )?;
     println!("ECDH shared secret computed (matchmaker never saw it)");
 
-    // ── Register with matchmaker bridge ────────────────────────────
     let reg_msg = serde_json::json!({
         "type": "heartbeat",
         "payload": {
@@ -794,7 +826,6 @@ fn main() -> Result<()> {
     });
     ws.send(Message::Text(serde_json::to_string(&reg_msg)?))?;
 
-    // ── Job processing loop via WebSocket bridge ─────────────────────
     while !shutdown.load(Ordering::SeqCst) {
         let msg = match ws.read() {
             Ok(m) => m,
@@ -817,7 +848,6 @@ fn main() -> Result<()> {
 
                 let current_job_id = payload.job_id.clone().unwrap_or_default();
 
-                // ── Derive AES key from shared secret + per-job salt ─
                 let result = match &payload.salt_b64 {
                     Some(s) => {
                         let salt = general_purpose::STANDARD
@@ -829,13 +859,12 @@ fn main() -> Result<()> {
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
                         aes_key.copy_from_slice(&derive_aes_key(&shared_secret, &salt));
-                        // XOR-blind: final_key = aes_key XOR shared_secret
                         let mut final_key = [0u8; AEAD_KEY_SIZE];
                         for i in 0..AEAD_KEY_SIZE {
                             final_key[i] = aes_key[i] ^ shared_secret[i];
                         }
                         println!("AES key derived via HKDF and XOR-blinded for job {}", current_job_id);
-                        handle_job(&client, &payload, &final_key)
+                        handle_job(client, &payload, &final_key)
                     }
                     None => {
                         let key_b64 = payload.enc_key_b64.as_deref().unwrap_or("");
@@ -852,12 +881,11 @@ fn main() -> Result<()> {
                             }
                             let mut aes_key = [0u8; AEAD_KEY_SIZE];
                             aes_key.copy_from_slice(&key_bytes);
-                            handle_job(&client, &payload, &aes_key)
+                            handle_job(client, &payload, &aes_key)
                         }
                     }
                 };
 
-                // ── Send result over WebSocket bridge ─────────────────
                 let reply = match result {
                     Ok(result_url) => {
                         println!("Job {} completed successfully", current_job_id);
@@ -892,6 +920,5 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("Agent shutting down gracefully");
     Ok(())
 }
