@@ -722,7 +722,13 @@ struct AgentConfig {
 }
 
 fn config_dir() -> String {
-    env::var("TENXO_CONFIG_DIR").unwrap_or_else(|_| "/etc/tenxo".into())
+    if let Ok(dir) = env::var("TENXO_CONFIG_DIR") {
+        return dir;
+    }
+    if let Ok(home) = env::var("HOME") {
+        return format!("{}/.config/tenxo", home);
+    }
+    "/etc/tenxo".into()
 }
 
 fn config_path() -> String {
@@ -757,10 +763,12 @@ fn resolve_node_id() -> Result<String> {
         println!("Using node_id from config: {}", cfg.node_id);
         return Ok(cfg.node_id);
     }
-    // 3. Generate a new one and persist
+    // 3. Generate a new one and persist (best-effort)
     let node_id = format!("node-{}", Uuid::new_v4());
-    save_config(&AgentConfig { node_id: node_id.clone() })?;
-    println!("Generated and saved new node_id: {}", node_id);
+    match save_config(&AgentConfig { node_id: node_id.clone() }) {
+        Ok(_) => println!("Generated and saved new node_id: {}", node_id),
+        Err(e) => eprintln!("Warning: could not persist node_id config: {}", e),
+    }
     Ok(node_id)
 }
 
