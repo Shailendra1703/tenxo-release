@@ -899,6 +899,14 @@ fn run_agent(
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("invalid job message from bridge: {}", e);
+                        let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
+                            "type": "result",
+                            "payload": {
+                                "job_id": "",
+                                "status": "error",
+                                "error": format!("invalid job message: {}", e),
+                            }
+                        })).unwrap()));
                         continue;
                     }
                 };
@@ -911,7 +919,16 @@ fn run_agent(
                             .decode(s)
                             .context("failed to decode salt")?;
                         if salt.len() != SALT_SIZE {
-                            eprintln!("invalid salt length: {} (expected {})", salt.len(), SALT_SIZE);
+                            let err = format!("invalid salt length: {} (expected {})", salt.len(), SALT_SIZE);
+                            eprintln!("{}", err);
+                            let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
+                                "type": "result",
+                                "payload": {
+                                    "job_id": current_job_id,
+                                    "status": "error",
+                                    "error": err,
+                                }
+                            })).unwrap()));
                             continue;
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
@@ -926,20 +943,37 @@ fn run_agent(
                     None => {
                         let key_b64 = payload.enc_key_b64.as_deref().unwrap_or("");
                         if key_b64.is_empty() {
-                            eprintln!("no enc_key_b64 or salt_b64 in job message");
-                            Err(anyhow!("missing encryption key"))
-                        } else {
-                            let key_bytes = general_purpose::STANDARD
-                                .decode(key_b64)
-                                .context("failed to decode enc_key_b64")?;
-                            if key_bytes.len() != AEAD_KEY_SIZE {
-                                eprintln!("invalid key length: {}", key_bytes.len());
-                                continue;
-                            }
-                            let mut aes_key = [0u8; AEAD_KEY_SIZE];
-                            aes_key.copy_from_slice(&key_bytes);
-                            handle_job(client, &payload, &aes_key)
+                            let err = "no enc_key_b64 or salt_b64 in job message";
+                            eprintln!("{}", err);
+                            let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
+                                "type": "result",
+                                "payload": {
+                                    "job_id": current_job_id,
+                                    "status": "error",
+                                    "error": err,
+                                }
+                            })).unwrap()));
+                            continue;
                         }
+                        let key_bytes = general_purpose::STANDARD
+                            .decode(key_b64)
+                            .context("failed to decode enc_key_b64")?;
+                        if key_bytes.len() != AEAD_KEY_SIZE {
+                            let err = format!("invalid key length: {}", key_bytes.len());
+                            eprintln!("{}", err);
+                            let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
+                                "type": "result",
+                                "payload": {
+                                    "job_id": current_job_id,
+                                    "status": "error",
+                                    "error": err,
+                                }
+                            })).unwrap()));
+                            continue;
+                        }
+                        let mut aes_key = [0u8; AEAD_KEY_SIZE];
+                        aes_key.copy_from_slice(&key_bytes);
+                        handle_job(client, &payload, &aes_key)
                     }
                 };
 
