@@ -34,7 +34,7 @@ use base64::engine::general_purpose;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::env;
 use std::fs::{self, File};
@@ -714,13 +714,62 @@ fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+// ─── Agent Config (persistent across restarts) ──────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct AgentConfig {
+    node_id: String,
+}
+
+fn config_dir() -> String {
+    env::var("TENXO_CONFIG_DIR").unwrap_or_else(|_| "/etc/tenxo".into())
+}
+
+fn config_path() -> String {
+    format!("{}/agent.json", config_dir())
+}
+
+fn load_config() -> Option<AgentConfig> {
+    let path = config_path();
+    let content = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn save_config(cfg: &AgentConfig) -> Result<()> {
+    let dir = config_dir();
+    fs::create_dir_all(&dir).context("failed to create config directory")?;
+    let content = serde_json::to_string_pretty(cfg)?;
+    fs::write(config_path(), &content).context("failed to write config file")?;
+    println!("Saved agent config to {}", config_path());
+    Ok(())
+}
+
+fn resolve_node_id() -> Result<String> {
+    // 1. Env var takes highest priority (for testing / explicit override)
+    if let Ok(nid) = env::var("NODE_ID") {
+        if !nid.is_empty() {
+            println!("Using NODE_ID from environment");
+            return Ok(nid);
+        }
+    }
+    // 2. Try loading from persistent config
+    if let Some(cfg) = load_config() {
+        println!("Using node_id from config: {}", cfg.node_id);
+        return Ok(cfg.node_id);
+    }
+    // 3. Generate a new one and persist
+    let node_id = format!("node-{}", Uuid::new_v4());
+    save_config(&AgentConfig { node_id: node_id.clone() })?;
+    println!("Generated and saved new node_id: {}", node_id);
+    Ok(node_id)
+}
+
 // ─── Main Entry Point ──────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let matchmaker_url =
         env::var("MATCHMAKER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let node_id =
-        env::var("NODE_ID").unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
+    let node_id = resolve_node_id()?;
     let owner = env::var("OWNER").unwrap_or_else(|_| String::new());
 
     let (gpu_model, gpu_vram_mb) = query_gpu_info();
