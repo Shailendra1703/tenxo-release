@@ -60,6 +60,7 @@ const AEAD_KEY_SIZE: usize = 32;
 const SALT_SIZE: usize = 32;
 const PADDING_TRAILER_SIZE: usize = 8;
 const HEARTBEAT_INTERVAL_SECS: u64 = 20;
+const DEFAULT_DOCKER_TIMEOUT_SECS: u64 = 540;
 
 // ─── GPU Detection ──────────────────────────────────────────────────────────
 
@@ -381,8 +382,14 @@ fn detect_nvidia_pci_devices() -> Vec<String> {
 fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) -> Result<()> {
     let (image, cmd) = build_docker_config(job_type, config);
     let runtime = get_container_runtime();
+    let timeout_secs = env::var("AGENT_DOCKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DOCKER_TIMEOUT_SECS);
 
     let work_dir = workspace.to_string_lossy().to_string();
+    fs::create_dir_all(workspace.join("output"))
+        .context("failed to create workspace output directory")?;
     let mount_ro = format!("{}:/workspace:ro", work_dir);
     let mount_out = format!("{}:/workspace/output", work_dir);
 
@@ -430,20 +437,60 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) 
     docker_args.push("32g".to_string());
     docker_args.push("--cpus".to_string());
     docker_args.push("8".to_string());
-    docker_args.push(image);
+    docker_args.push(image.clone());
     for c in &cmd {
         docker_args.push(c.clone());
     }
 
-    println!("Running job with runtime {:?}", runtime);
-    let output = Command::new("docker")
+    println!("Running job with runtime {:?}, image {}, timeout {}s", runtime, image, timeout_secs);
+    let mut child = Command::new("docker")
         .args(&docker_args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("failed to execute docker")?;
 
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(timeout_secs) {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .context("failed to collect timed-out docker output")?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "docker timed out after {}s. stdout={} stderr={}",
+                timeout_secs,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to collect docker output")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        println!("Docker stdout: {}", stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("Docker stderr: {}", stderr.trim());
+    }
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("docker exited with {:?}: {}", output.status.code(), stderr));
+        return Err(anyhow!(
+            "docker exited with {:?}. stdout={} stderr={}",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        ));
     }
 
     Ok(())
@@ -461,7 +508,7 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
             let cmd = format!(
-                "bash -c 'if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}'",
+                "bash -c 'if [ -f requirements.txt ]; then echo \"Skipping requirements.txt install because job network is disabled; bake dependencies into the image\"; fi; python {}'",
                 script
             );
             (image.into(), vec!["bash".into(), "-c".into(), cmd])
