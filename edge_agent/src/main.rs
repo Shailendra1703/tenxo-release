@@ -97,6 +97,10 @@ struct JobMsg {
     enc_key_b64: Option<String>,
     #[serde(default)]
     salt_b64: Option<String>,
+    #[serde(default)]
+    script: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
 }
 
 #[derive(serde::Serialize, Deserialize, Clone)]
@@ -452,11 +456,15 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .get("script")
                 .and_then(|v| v.as_str())
                 .unwrap_or("main.py");
+            let image = config
+                .get("image")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
             let cmd = format!(
                 "bash -c 'if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}'",
                 script
             );
-            ("python:3.11-slim".into(), vec!["bash".into(), "-c".into(), cmd])
+            (image.into(), vec!["bash".into(), "-c".into(), cmd])
         }
         "blender" => {
             let blend = config
@@ -759,9 +767,13 @@ fn handle_job(
 
     // ── Step 4: Execute inside Docker/Kata ────────────────────────────
     let job_type = "python";
-    let config = serde_json::json!({
-        "script": "main.py",
-    });
+    let mut config = serde_json::json!({});
+    if let Some(script) = &job.script {
+        config["script"] = serde_json::Value::String(script.clone());
+    }
+    if let Some(image) = &job.image {
+        config["image"] = serde_json::Value::String(image.clone());
+    }
 
     run_docker_job(&workspace, job_type, &config)
         .context("Docker execution failed")?;
@@ -849,6 +861,17 @@ fn handle_job(
 }
 
 // ─── Networking ────────────────────────────────────────────────────────────
+
+fn send_error(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, job_id: &str, msg: &str) {
+    let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
+        "type": "result",
+        "payload": {
+            "job_id": job_id,
+            "status": "error",
+            "error": msg,
+        }
+    })).unwrap()));
+}
 
 fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
     let res = client
@@ -1064,20 +1087,19 @@ fn run_agent(
 
                 let result = match &payload.salt_b64 {
                     Some(s) => {
-                        let salt = general_purpose::STANDARD
-                            .decode(s)
-                            .context("failed to decode salt")?;
+                        let salt = match general_purpose::STANDARD.decode(s) {
+                            Ok(salt) => salt,
+                            Err(e) => {
+                                let err = format!("failed to decode salt: {}", e);
+                                eprintln!("{}", err);
+                                send_error(&mut ws, &current_job_id, &err);
+                                continue;
+                            }
+                        };
                         if salt.len() != SALT_SIZE {
                             let err = format!("invalid salt length: {} (expected {})", salt.len(), SALT_SIZE);
                             eprintln!("{}", err);
-                            let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
-                                "type": "result",
-                                "payload": {
-                                    "job_id": current_job_id,
-                                    "status": "error",
-                                    "error": err,
-                                }
-                            })).unwrap()));
+                            send_error(&mut ws, &current_job_id, &err);
                             continue;
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
@@ -1094,30 +1116,22 @@ fn run_agent(
                         if key_b64.is_empty() {
                             let err = "no enc_key_b64 or salt_b64 in job message";
                             eprintln!("{}", err);
-                            let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
-                                "type": "result",
-                                "payload": {
-                                    "job_id": current_job_id,
-                                    "status": "error",
-                                    "error": err,
-                                }
-                            })).unwrap()));
+                            send_error(&mut ws, &current_job_id, &err);
                             continue;
                         }
-                        let key_bytes = general_purpose::STANDARD
-                            .decode(key_b64)
-                            .context("failed to decode enc_key_b64")?;
+                        let key_bytes = match general_purpose::STANDARD.decode(key_b64) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                let err = format!("failed to decode enc_key_b64: {}", e);
+                                eprintln!("{}", err);
+                                send_error(&mut ws, &current_job_id, &err);
+                                continue;
+                            }
+                        };
                         if key_bytes.len() != AEAD_KEY_SIZE {
                             let err = format!("invalid key length: {}", key_bytes.len());
                             eprintln!("{}", err);
-                            let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
-                                "type": "result",
-                                "payload": {
-                                    "job_id": current_job_id,
-                                    "status": "error",
-                                    "error": err,
-                                }
-                            })).unwrap()));
+                            send_error(&mut ws, &current_job_id, &err);
                             continue;
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
