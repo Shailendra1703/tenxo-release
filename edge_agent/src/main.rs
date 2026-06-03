@@ -58,6 +58,7 @@ mod sev_snp;
 const NONCE_SIZE: usize = 12;
 const AEAD_KEY_SIZE: usize = 32;
 const SALT_SIZE: usize = 32;
+const PADDING_TRAILER_SIZE: usize = 8;
 const HEARTBEAT_INTERVAL_SECS: u64 = 20;
 
 // ─── GPU Detection ──────────────────────────────────────────────────────────
@@ -148,15 +149,48 @@ fn derive_aes_key(shared_secret: &[u8], salt: &[u8]) -> [u8; AEAD_KEY_SIZE] {
 // ─── Padding Removal ────────────────────────────────────────────────────────
 
 fn unpad_payload(padded: &[u8]) -> Result<Vec<u8>> {
-    if padded.is_empty() {
-        return Err(anyhow!("empty padded payload"));
+    if padded.len() < PADDING_TRAILER_SIZE {
+        return Err(anyhow!("padded payload is too short: {} bytes", padded.len()));
     }
-    let pad_len = padded[padded.len() - 1] as usize;
-    if pad_len >= padded.len() {
-        return Err(anyhow!("invalid padding length: {} >= {}", pad_len, padded.len()));
+    let trailer = &padded[padded.len() - PADDING_TRAILER_SIZE..];
+    let original_size = u64::from_be_bytes(
+        trailer
+            .try_into()
+            .expect("padding trailer must be exactly 8 bytes"),
+    ) as usize;
+    if original_size > padded.len() - PADDING_TRAILER_SIZE {
+        return Err(anyhow!(
+            "invalid original size {} for padded payload of {} bytes",
+            original_size,
+            padded.len()
+        ));
     }
-    let original_size = padded.len() - pad_len - 1;
     Ok(padded[..original_size].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{unpad_payload, PADDING_TRAILER_SIZE};
+
+    #[test]
+    fn unpad_payload_uses_original_size_trailer() {
+        let original = b"PK\x03\x04zip-data";
+        let mut padded = Vec::from(&original[..]);
+        padded.resize(16 * 1024 * 1024 - PADDING_TRAILER_SIZE, 42);
+        padded.extend_from_slice(&(original.len() as u64).to_be_bytes());
+
+        let plain = unpad_payload(&padded).expect("payload should unpad");
+        assert_eq!(plain, original);
+    }
+
+    #[test]
+    fn unpad_payload_rejects_invalid_original_size() {
+        let mut padded = vec![0u8; PADDING_TRAILER_SIZE];
+        padded.copy_from_slice(&(1024u64).to_be_bytes());
+
+        let err = unpad_payload(&padded).expect_err("invalid trailer should fail");
+        assert!(err.to_string().contains("invalid original size"));
+    }
 }
 
 // ─── AES-256-GCM Decryption ────────────────────────────────────────────────
