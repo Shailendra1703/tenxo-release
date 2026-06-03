@@ -102,6 +102,8 @@ struct JobMsg {
     script: Option<String>,
     #[serde(default)]
     image: Option<String>,
+    #[serde(default)]
+    job_type: Option<String>,
 }
 
 #[derive(serde::Serialize, Deserialize, Clone)]
@@ -398,13 +400,13 @@ fn detect_nvidia_pci_devices() -> Vec<String> {
     }
 }
 
-fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) -> Result<()> {
+fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, job_id: &str) -> Result<()> {
     let (image, cmd) = build_docker_config(job_type, config);
     let runtime = get_container_runtime();
 
     let work_dir = workspace.to_string_lossy().to_string();
     let mount_ro = format!("{}:/workspace:ro", work_dir);
-    let mount_out = format!("{}:/workspace/output", work_dir);
+    let mount_out = format!("{}/output:/workspace/output", work_dir);
 
     let mut docker_args: Vec<String> = vec!["run".to_string()];
 
@@ -448,13 +450,15 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) 
     docker_args.push("-w".to_string());
     docker_args.push("/workspace".to_string());
     docker_args.push("-e".to_string());
-    docker_args.push("JOB_ID=tenxo".to_string());
+    docker_args.push(format!("JOB_ID={}", job_id));
     docker_args.push("-e".to_string());
     docker_args.push("PYTHONUNBUFFERED=1".to_string());
+    let memory_limit = env::var("DOCKER_MEMORY").unwrap_or_else(|_| "32g".into());
+    let cpu_limit = env::var("DOCKER_CPUS").unwrap_or_else(|_| "8".into());
     docker_args.push("--memory".to_string());
-    docker_args.push("32g".to_string());
+    docker_args.push(memory_limit);
     docker_args.push("--cpus".to_string());
-    docker_args.push("8".to_string());
+    docker_args.push(cpu_limit);
     docker_args.push(image);
     for c in &cmd {
         docker_args.push(c.clone());
@@ -822,7 +826,7 @@ fn handle_job(
     println!("Extracted workspace to LUKS-protected {:?}", workspace);
 
     // ── Step 4: Execute inside Docker/Kata ────────────────────────────
-    let job_type = "python";
+    let job_type = job.job_type.as_deref().unwrap_or("python");
     let mut config = serde_json::json!({});
     if let Some(script) = &job.script {
         config["script"] = serde_json::Value::String(script.clone());
@@ -831,7 +835,7 @@ fn handle_job(
         config["image"] = serde_json::Value::String(image.clone());
     }
 
-    run_docker_job(&workspace, job_type, &config)
+    run_docker_job(&workspace, job_type, &config, job_id)
         .context("Docker execution failed")?;
     println!("Job execution complete");
 
