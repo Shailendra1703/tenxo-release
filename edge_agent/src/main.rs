@@ -38,9 +38,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::env;
 use std::fs::{self, File};
+use std::io::Write;
 use std::net::TcpStream;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -480,76 +481,185 @@ fn create_luks_passphrase() -> Result<String> {
     Ok(hex::encode(buf))
 }
 
-fn run_cmd(args: &[&str]) -> Result<()> {
-    let output = Command::new(args[0])
-        .args(&args[1..])
+fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
         .output()
-        .with_context(|| format!("failed to execute: {:?}", args))?;
+        .with_context(|| format!("failed to execute: {} {:?}", program, args))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("command {:?} failed: {}", args, stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "command {} {:?} failed with status {}: stderr={} stdout={}",
+            program,
+            args,
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        ));
     }
     Ok(())
 }
 
-fn setup_luks_container(container_path: &std::path::Path, passphrase: &str, mount_point: &std::path::Path) -> Result<()> {
+fn run_cmd_with_stdin(program: &str, args: &[&str], stdin_data: &[u8]) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to execute: {} {:?}", program, args))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open child stdin")?;
+        stdin
+            .write_all(stdin_data)
+            .with_context(|| format!("failed to write stdin for {} {:?}", program, args))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for {} {:?}", program, args))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "command {} {:?} failed with status {}: stderr={} stdout={}",
+            program,
+            args,
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn luks_preflight() -> Result<()> {
+    for bin in ["cryptsetup", "mkfs.ext4", "mount", "umount", "shred"] {
+        run_cmd("which", &[bin])
+            .with_context(|| format!("required command '{}' is not installed", bin))?;
+    }
+
+    if !Path::new("/dev/mapper/control").exists() {
+        return Err(anyhow!(
+            "dm-crypt device mapper is unavailable (/dev/mapper/control missing); run the agent with root/CAP_SYS_ADMIN and device-mapper support"
+        ));
+    }
+
+    Ok(())
+}
+
+fn setup_luks_container(container_path: &std::path::Path, passphrase: &str, mount_point: &std::path::Path, job_id: &str) -> Result<String> {
     let container_str = container_path.to_string_lossy();
-    let mapper_name = "tenxo-workspace";
+    let mapper_name = format!(
+        "tenxo-workspace-{}",
+        job_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect::<String>()
+    );
     let mapper_dev = format!("/dev/mapper/{}", mapper_name);
     let mount_str = mount_point.to_string_lossy();
 
+    luks_preflight()?;
+
     // Create sparse container file (256 MB for workspace data)
-    run_cmd(&["dd", "if=/dev/zero", &format!("of={}", container_str),
-              "bs=1M", "count=256", "seek=256", "status=none"])?;
+    run_cmd("truncate", &["-s", "256M", &container_str])?;
 
-    // Pipe passphrase to luksFormat
-    let format_output = Command::new("bash")
-        .args(["-c", &format!("echo -n '{}' | cryptsetup luksFormat --type luks2 --pbkdf argon2i --iter-time 500 --key-size 256 {} -", passphrase, container_str)])
-        .output()
-        .context("luksFormat failed")?;
-    if !format_output.status.success() {
-        let stderr = String::from_utf8_lossy(&format_output.stderr);
-        return Err(anyhow!("luksFormat failed: {}", stderr));
-    }
+    let passphrase_bytes = passphrase.as_bytes();
 
-    // Open the LUKS container
-    let open_output = Command::new("bash")
-        .args(["-c", &format!("echo -n '{}' | cryptsetup open {} {} -", passphrase, container_str, mapper_name)])
-        .output()
-        .context("cryptsetup open failed")?;
-    if !open_output.status.success() {
-        let stderr = String::from_utf8_lossy(&open_output.stderr);
-        return Err(anyhow!("cryptsetup open failed: {}", stderr));
-    }
+    run_cmd_with_stdin(
+        "cryptsetup",
+        &[
+            "luksFormat",
+            "--batch-mode",
+            "--type",
+            "luks2",
+            "--pbkdf",
+            "argon2i",
+            "--iter-time",
+            "500",
+            "--key-size",
+            "256",
+            "--key-file",
+            "-",
+            &container_str,
+        ],
+        passphrase_bytes,
+    )
+    .context("luksFormat failed")?;
+
+    run_cmd_with_stdin(
+        "cryptsetup",
+        &["open", "--key-file", "-", &container_str, &mapper_name],
+        passphrase_bytes,
+    )
+    .context("cryptsetup open failed")?;
 
     // Create ext4 filesystem inside
-    run_cmd(&["mkfs.ext4", "-q", &mapper_dev])?;
+    run_cmd("mkfs.ext4", &["-q", &mapper_dev])?;
 
     // Mount
     fs::create_dir_all(mount_point)?;
-    run_cmd(&["mount", &mapper_dev, &mount_str])?;
+    run_cmd("mount", &[&mapper_dev, &mount_str])?;
 
     // Ensure non-root user can write
-    run_cmd(&["chmod", "1777", &mount_str])?;
+    run_cmd("chmod", &["1777", &mount_str])?;
 
-    Ok(())
+    Ok(mapper_name)
 }
 
-fn teardown_luks_container(container_path: &std::path::Path, mount_point: &std::path::Path) -> Result<()> {
+fn teardown_luks_container(container_path: &std::path::Path, mount_point: &std::path::Path, mapper_name: &str) -> Result<()> {
     let mount_str = mount_point.to_string_lossy();
     let container_str = container_path.to_string_lossy();
 
     // Unmount
-    let _ = run_cmd(&["umount", "-l", &mount_str]);
+    let _ = run_cmd("umount", &["-l", &mount_str]);
     let _ = fs::remove_dir_all(mount_point);
 
     // Close LUKS device
-    let _ = run_cmd(&["cryptsetup", "close", "tenxo-workspace"]);
+    let _ = run_cmd("cryptsetup", &["close", mapper_name]);
 
     // Securely overwrite container file
-    let _ = run_cmd(&["shred", "-u", "-n", "1", &container_str]);
+    let _ = run_cmd("shred", &["-u", "-n", "1", &container_str]);
 
     Ok(())
+}
+
+struct LuksContainer {
+    container_path: PathBuf,
+    mount_point: PathBuf,
+    mapper_name: String,
+    torn_down: bool,
+}
+
+impl LuksContainer {
+    fn new(container_path: PathBuf, mount_point: PathBuf, mapper_name: String) -> Self {
+        Self {
+            container_path,
+            mount_point,
+            mapper_name,
+            torn_down: false,
+        }
+    }
+
+    fn teardown(&mut self) -> Result<()> {
+        if !self.torn_down {
+            teardown_luks_container(&self.container_path, &self.mount_point, &self.mapper_name)?;
+            self.torn_down = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LuksContainer {
+    fn drop(&mut self) {
+        let _ = self.teardown();
+    }
 }
 
 // ─── Integrity Hash ─────────────────────────────────────────────────────────
@@ -592,13 +702,18 @@ fn handle_job(
     let mount_point = td.path().join("mnt");
 
     let passphrase = create_luks_passphrase()?;
-    setup_luks_container(&container_path, &passphrase, &mount_point)
+    let mapper_name = setup_luks_container(&container_path, &passphrase, &mount_point, job_id)
         .context("LUKS container setup failed")?;
+    let mut luks_container = LuksContainer::new(
+        container_path.clone(),
+        mount_point.clone(),
+        mapper_name,
+    );
 
     let workspace = mount_point.join("job");
     fs::create_dir_all(&workspace)?;
 
-    let payload_zip = td.path().join("payload.zip");
+    let payload_zip = mount_point.join("payload.zip");
     fs::write(&payload_zip, &plain)
         .context("failed to write decrypted zip to LUKS")?;
 
@@ -659,7 +774,7 @@ fn handle_job(
     let receipt_bytes = serde_json::to_vec(&receipt)?;
 
     // ── Step 6: Teardown LUKS container ───────────────────────────────
-    teardown_luks_container(&container_path, &mount_point)?;
+    luks_container.teardown()?;
     println!("LUKS container securely torn down");
 
     // ── Step 7: Re-encrypt results INSIDE TEE ──────────────────────────
