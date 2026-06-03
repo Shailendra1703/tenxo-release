@@ -41,7 +41,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +61,6 @@ const AEAD_KEY_SIZE: usize = 32;
 const SALT_SIZE: usize = 32;
 const PADDING_TRAILER_SIZE: usize = 8;
 const HEARTBEAT_INTERVAL_SECS: u64 = 20;
-const DEFAULT_DOCKER_TIMEOUT_SECS: u64 = 540;
 
 // ─── GPU Detection ──────────────────────────────────────────────────────────
 
@@ -350,6 +350,25 @@ fn perform_key_exchange(
 
 // ─── Container Runtime (Docker / Kata) ──────────────────────────────────────
 
+fn docker_has_gpu_support() -> bool {
+    // Check nvidia-smi first (drivers loaded)
+    if Command::new("nvidia-smi").output().is_err() {
+        return false;
+    }
+    // Then check Docker has the nvidia runtime registered
+    Command::new("docker")
+        .args(["info", "--format", "{{.Runtimes}}"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout);
+            Some(s.contains("nvidia"))
+        } else {
+            Some(false)
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RuntimeKind {
     Docker,
@@ -382,14 +401,8 @@ fn detect_nvidia_pci_devices() -> Vec<String> {
 fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) -> Result<()> {
     let (image, cmd) = build_docker_config(job_type, config);
     let runtime = get_container_runtime();
-    let timeout_secs = env::var("AGENT_DOCKER_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_DOCKER_TIMEOUT_SECS);
 
     let work_dir = workspace.to_string_lossy().to_string();
-    fs::create_dir_all(workspace.join("output"))
-        .context("failed to create workspace output directory")?;
     let mount_ro = format!("{}:/workspace:ro", work_dir);
     let mount_out = format!("{}:/workspace/output", work_dir);
 
@@ -411,8 +424,13 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) 
             }
         }
         RuntimeKind::Docker => {
-            docker_args.push("--gpus".to_string());
-            docker_args.push("all".to_string());
+            if docker_has_gpu_support() {
+                docker_args.push("--gpus".to_string());
+                docker_args.push("all".to_string());
+                println!("Docker: GPU passthrough enabled via --gpus all");
+            } else {
+                println!("Docker: nvidia-container-toolkit not detected — running without GPU");
+            }
         }
     }
 
@@ -437,60 +455,51 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value) 
     docker_args.push("32g".to_string());
     docker_args.push("--cpus".to_string());
     docker_args.push("8".to_string());
-    docker_args.push(image.clone());
+    docker_args.push(image);
     for c in &cmd {
         docker_args.push(c.clone());
     }
 
-    println!("Running job with runtime {:?}, image {}, timeout {}s", runtime, image, timeout_secs);
+    println!("Running job with runtime {:?}", runtime);
+
     let mut child = Command::new("docker")
         .args(&docker_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to execute docker")?;
+        .context("failed to spawn docker")?;
 
-    let started = std::time::Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if started.elapsed() > Duration::from_secs(timeout_secs) {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out docker output")?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "docker timed out after {}s. stdout={} stderr={}",
-                timeout_secs,
-                stdout.trim(),
-                stderr.trim()
-            ));
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    // 10-minute timeout — Docker build/pull + execution
+    let max_wait = Duration::from_secs(600);
+    let start = Instant::now();
 
-    let output = child
-        .wait_with_output()
-        .context("failed to collect docker output")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stdout.trim().is_empty() {
-        println!("Docker stdout: {}", stdout.trim());
-    }
-    if !stderr.trim().is_empty() {
-        eprintln!("Docker stderr: {}", stderr.trim());
-    }
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = child.wait_with_output().unwrap_or_else(|_| {
+                    Output { status, stdout: vec![], stderr: vec![] }
+                });
+                break out;
+            }
+            Ok(None) => {
+                if start.elapsed() > max_wait {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!("docker execution timed out after 600s"));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("docker process error: {}", e));
+            }
+        }
+    };
 
     if !output.status.success() {
-        return Err(anyhow!(
-            "docker exited with {:?}. stdout={} stderr={}",
-            output.status.code(),
-            stdout.trim(),
-            stderr.trim()
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("docker exited with {:?}: {}", output.status.code(), stderr));
     }
 
     Ok(())
@@ -508,7 +517,7 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
             let cmd = format!(
-                "bash -c 'if [ -f requirements.txt ]; then echo \"Skipping requirements.txt install because job network is disabled; bake dependencies into the image\"; fi; python {}'",
+                "bash -c 'if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}'",
                 script
             );
             (image.into(), vec!["bash".into(), "-c".into(), cmd])
