@@ -353,22 +353,24 @@ fn perform_key_exchange(
 // ─── Container Runtime (Docker / Kata) ──────────────────────────────────────
 
 fn docker_has_gpu_support() -> bool {
-    // Check nvidia-smi first (drivers loaded)
-    if Command::new("nvidia-smi").output().is_err() {
-        return false;
-    }
-    // Then check Docker has the nvidia runtime registered
-    Command::new("docker")
-        .args(["info", "--format", "{{.Runtimes}}"])
-        .output()
-        .ok()
-        .and_then(|o| if o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout);
-            Some(s.contains("nvidia"))
-        } else {
-            Some(false)
-        })
-        .unwrap_or(false)
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if Command::new("nvidia-smi").output().is_err() {
+            return false;
+        }
+        Command::new("docker")
+            .args(["info", "--format", "{{.Runtimes}}"])
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout);
+                Some(s.contains("nvidia"))
+            } else {
+                Some(false)
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -400,9 +402,29 @@ fn detect_nvidia_pci_devices() -> Vec<String> {
     }
 }
 
+fn pull_docker_image(image: &str) -> Result<()> {
+    println!("Pulling Docker image: {}", image);
+    let pull_output = Command::new("docker")
+        .args(["pull", image])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to execute docker pull")?;
+
+    if !pull_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pull_output.stderr);
+        return Err(anyhow!("docker pull failed for {}: {}", image, stderr.trim()));
+    }
+
+    println!("Docker image {} pulled successfully", image);
+    Ok(())
+}
+
 fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, job_id: &str) -> Result<()> {
     let (image, cmd) = build_docker_config(job_type, config);
     let runtime = get_container_runtime();
+
+    pull_docker_image(&image)?;
 
     let work_dir = workspace.to_string_lossy().to_string();
     let mount_ro = format!("{}:/workspace:ro", work_dir);
@@ -437,8 +459,6 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     }
 
     docker_args.push("--rm".to_string());
-    docker_args.push("--network".to_string());
-    docker_args.push("none".to_string());
     docker_args.push("--security-opt".to_string());
     docker_args.push("no-new-privileges:true".to_string());
     docker_args.push("--cap-drop".to_string());
@@ -464,6 +484,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
         docker_args.push(c.clone());
     }
 
+    println!("Running Docker command: docker {}", docker_args.join(" "));
     println!("Running job with runtime {:?}", runtime);
 
     let mut child = Command::new("docker")
@@ -480,9 +501,13 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     let output = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let out = child.wait_with_output().unwrap_or_else(|_| {
-                    Output { status, stdout: vec![], stderr: vec![] }
-                });
+                let out = match child.wait_with_output() {
+                    Ok(out) => out,
+                    Err(e) => {
+                        eprintln!("warning: failed to read docker output: {}", e);
+                        Output { status, stdout: vec![], stderr: vec![] }
+                    }
+                };
                 break out;
             }
             Ok(None) => {
@@ -503,7 +528,10 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("docker exited with {:?}: {}", output.status.code(), stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("Docker stdout:\n{}", stdout);
+        eprintln!("Docker stderr:\n{}", stderr);
+        return Err(anyhow!("docker exited with {:?}: {}", output.status.code(), stderr.trim()));
     }
 
     Ok(())
