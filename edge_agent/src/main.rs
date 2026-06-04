@@ -426,6 +426,10 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
 
     pull_docker_image(&image)?;
 
+    let output_dir = workspace.join("output");
+    fs::create_dir_all(&output_dir)
+    .context("failed to create output directory")?;
+
     let work_dir = workspace.to_string_lossy().to_string();
     let mount_ro = format!("{}:/workspace:ro", work_dir);
     let mount_out = format!("{}/output:/workspace/output", work_dir);
@@ -531,7 +535,12 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
         let stdout = String::from_utf8_lossy(&output.stdout);
         eprintln!("Docker stdout:\n{}", stdout);
         eprintln!("Docker stderr:\n{}", stderr);
-        return Err(anyhow!("docker exited with {:?}: {}", output.status.code(), stderr.trim()));
+        return Err(anyhow!(
+        "docker exited with code {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    ));
     }
 
     Ok(())
@@ -548,11 +557,12 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .get("image")
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
-            let cmd = format!(
-                "bash -c 'if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}'",
-                script
-            );
-            (image.into(), vec!["bash".into(), "-c".into(), cmd])
+                let cmd = format!(
+            "if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}",
+            script
+        );
+
+        (image.into(), vec!["bash".into(), "-c".into(), cmd])
         }
         "blender" => {
             let blend = config
@@ -851,7 +861,18 @@ fn handle_job(
         .context("failed to open ZIP archive")?;
     archive.extract(&workspace)
         .context("failed to extract ZIP archive")?;
+    println!("Workspace contents:");
+
+    for entry in walkdir::WalkDir::new(&workspace) {
+        match entry {
+            Ok(e) => println!("  {}", e.path().display()),
+            Err(err) => eprintln!("walkdir error: {}", err),
+        }
+    }
     println!("Extracted workspace to LUKS-protected {:?}", workspace);
+    println!("Job script requested: {:?}", job.script);
+    println!("Job image requested: {:?}", job.image);
+    println!("Job type: {:?}", job.job_type);
 
     // ── Step 4: Execute inside Docker/Kata ────────────────────────────
     let job_type = job.job_type.as_deref().unwrap_or("python");
@@ -861,6 +882,17 @@ fn handle_job(
     }
     if let Some(image) = &job.image {
         config["image"] = serde_json::Value::String(image.clone());
+    }
+
+    // - validating script exists before docker start
+    let script_name = job.script.as_deref().unwrap_or("main.py");
+    let script_path = workspace.join(script_name);
+
+    if !script_path.exists() {
+        return Err(anyhow!(
+            "script file not found after extraction: {}",
+            script_path.display()
+        ));
     }
 
     run_docker_job(&workspace, job_type, &config, job_id)
