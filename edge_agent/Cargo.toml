@@ -23,3 +23,4 @@ uuid = { version = "1", features = ["v4"] }
 tungstenite = { version = "0.21", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 ctrlc = "3.4"
 hex = "0.4"
+walkdir = "2"
