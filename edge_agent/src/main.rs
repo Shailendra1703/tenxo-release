@@ -432,7 +432,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
 
     let work_dir = workspace.to_string_lossy().to_string();
     let mount_ro = format!("{}:/workspace", work_dir);
-    let mount_out = format!("{}/output:/workspace/output", work_dir);
+    let mount_out = format!("{}/output:/output", work_dir);
 
     let mut docker_args: Vec<String> = vec!["run".to_string()];
 
@@ -558,7 +558,7 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
                 let cmd = format!(
-            "if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}",
+            "ls -la /workspace && if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}",
             script
         );
 
@@ -570,7 +570,7 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("scene.blend");
             let cmd = format!(
-                "bash -c 'apt-get update -qq && apt-get install -y -qq blender && blender -b {} -o /workspace/output/frame_#### -s 1 -e 1 -a'",
+                "bash -c 'apt-get update -qq && apt-get install -y -qq blender && blender -b {} -o /output/frame_#### -s 1 -e 1 -a'",
                 blend
             );
             ("nvidia/cuda:12.2.0-runtime-ubuntu22.04".into(), vec!["bash".into(), "-c".into(), cmd])
