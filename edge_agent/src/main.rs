@@ -431,7 +431,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     .context("failed to create output directory")?;
 
     let work_dir = workspace.to_string_lossy().to_string();
-    let mount_ro = format!("{}:/workspace:ro", work_dir);
+    let mount_ro = format!("{}:/workspace", work_dir);
     let mount_out = format!("{}/output:/workspace/output", work_dir);
 
     let mut docker_args: Vec<String> = vec!["run".to_string()];
