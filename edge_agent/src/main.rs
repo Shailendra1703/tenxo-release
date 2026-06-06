@@ -61,6 +61,7 @@ const AEAD_KEY_SIZE: usize = 32;
 const SALT_SIZE: usize = 32;
 const PADDING_TRAILER_SIZE: usize = 8;
 const HEARTBEAT_INTERVAL_SECS: u64 = 20;
+const DEFAULT_DOCKER_TIMEOUT_SECS: u64 = 540;
 
 // ─── GPU Detection ──────────────────────────────────────────────────────────
 
@@ -423,6 +424,10 @@ fn pull_docker_image(image: &str) -> Result<()> {
 fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, job_id: &str) -> Result<()> {
     let (image, cmd) = build_docker_config(job_type, config);
     let runtime = get_container_runtime();
+    let timeout_secs = env::var("AGENT_DOCKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DOCKER_TIMEOUT_SECS);
 
     pull_docker_image(&image)?;
 
@@ -431,8 +436,10 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     .context("failed to create output directory")?;
 
     let work_dir = workspace.to_string_lossy().to_string();
-    let mount_ro = format!("{}:/workspace", work_dir);
-    let mount_out = format!("{}/output:/output", work_dir);
+    fs::create_dir_all(workspace.join("output"))
+        .context("failed to create workspace output directory")?;
+    let mount_ro = format!("{}:/workspace:ro", work_dir);
+    let mount_out = format!("{}:/workspace/output", work_dir);
 
     let mut docker_args: Vec<String> = vec!["run".to_string()];
 
@@ -483,7 +490,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     docker_args.push(memory_limit);
     docker_args.push("--cpus".to_string());
     docker_args.push(cpu_limit);
-    docker_args.push(image);
+    docker_args.push(image.clone());
     for c in &cmd {
         docker_args.push(c.clone());
     }
@@ -528,7 +535,34 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
                 return Err(anyhow!("docker process error: {}", e));
             }
         }
-    };
+        if started.elapsed() > Duration::from_secs(timeout_secs) {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .context("failed to collect timed-out docker output")?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "docker timed out after {}s. stdout={} stderr={}",
+                timeout_secs,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to collect docker output")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        println!("Docker stdout: {}", stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("Docker stderr: {}", stderr.trim());
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
