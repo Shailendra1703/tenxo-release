@@ -535,7 +535,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
                 return Err(anyhow!("docker process error: {}", e));
             }
         }
-        if started.elapsed() > Duration::from_secs(timeout_secs) {
+        if start.elapsed() > Duration::from_secs(timeout_secs) {
             let _ = child.kill();
             let output = child
                 .wait_with_output()
@@ -550,19 +550,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
             ));
         }
         std::thread::sleep(Duration::from_secs(1));
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("failed to collect docker output")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stdout.trim().is_empty() {
-        println!("Docker stdout: {}", stdout.trim());
-    }
-    if !stderr.trim().is_empty() {
-        eprintln!("Docker stderr: {}", stderr.trim());
-    }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
