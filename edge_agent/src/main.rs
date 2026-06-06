@@ -436,10 +436,10 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     .context("failed to create output directory")?;
 
     let work_dir = workspace.to_string_lossy().to_string();
-    fs::create_dir_all(workspace.join("output"))
-        .context("failed to create workspace output directory")?;
-    let mount_ro = format!("{}:/workspace:ro", work_dir);
-    let mount_out = format!("{}:/workspace/output", work_dir);
+    // Mount the LUKS-backed workspace once. A read-only /workspace plus a nested
+    // /workspace/output bind mount fails on some Docker/runc setups because the
+    // nested mountpoint is created under the read-only parent during init.
+    let mount_workspace = format!("{}:/workspace:rw", work_dir);
 
     let mut docker_args: Vec<String> = vec!["run".to_string()];
 
@@ -475,9 +475,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     docker_args.push("--cap-drop".to_string());
     docker_args.push("ALL".to_string());
     docker_args.push("-v".to_string());
-    docker_args.push(mount_ro);
-    docker_args.push("-v".to_string());
-    docker_args.push(mount_out);
+    docker_args.push(mount_workspace);
     docker_args.push("-w".to_string());
     docker_args.push("/workspace".to_string());
     docker_args.push("-e".to_string());
