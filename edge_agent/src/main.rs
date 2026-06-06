@@ -460,9 +460,10 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
         }
         RuntimeKind::Docker => {
             if docker_has_gpu_support() {
+                docker_args.push("--runtime=nvidia".to_string());
                 docker_args.push("--gpus".to_string());
                 docker_args.push("all".to_string());
-                println!("Docker: GPU passthrough enabled via --gpus all");
+                println!("Docker: GPU passthrough enabled via --runtime=nvidia --gpus all");
             } else {
                 println!("Docker: nvidia-container-toolkit not detected — running without GPU");
             }
@@ -482,6 +483,14 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     docker_args.push(format!("JOB_ID={}", job_id));
     docker_args.push("-e".to_string());
     docker_args.push("PYTHONUNBUFFERED=1".to_string());
+    docker_args.push("-e".to_string());
+    docker_args.push("PIP_ROOT_USER_ACTION=ignore".to_string());
+    if runtime == RuntimeKind::Docker && docker_has_gpu_support() {
+        docker_args.push("-e".to_string());
+        docker_args.push("NVIDIA_VISIBLE_DEVICES=all".to_string());
+        docker_args.push("-e".to_string());
+        docker_args.push("NVIDIA_DRIVER_CAPABILITIES=compute,utility".to_string());
+    }
     let memory_limit = env::var("DOCKER_MEMORY").unwrap_or_else(|_| "32g".into());
     let cpu_limit = env::var("DOCKER_CPUS").unwrap_or_else(|_| "8".into());
     docker_args.push("--memory".to_string());
