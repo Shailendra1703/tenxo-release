@@ -96,6 +96,10 @@ struct JobMsg {
     encrypted_job_link: String,
     result_upload_url: String,
     #[serde(default)]
+    result_url: Option<String>,
+    #[serde(default)]
+    receipt_upload_url: Option<String>,
+    #[serde(default)]
     enc_key_b64: Option<String>,
     #[serde(default)]
     salt_b64: Option<String>,
@@ -1014,8 +1018,10 @@ fn handle_job(
     println!("Encrypted result uploaded to {}", job.result_upload_url);
     println!("Integrity receipt: input_sha256={} output_sha256={}", input_hash, output_hash);
 
-    // Append receipt URL to the result upload URL
-    let receipt_url = format!("{}.receipt", job.result_upload_url);
+    let receipt_url = job
+        .receipt_upload_url
+        .clone()
+        .unwrap_or_else(|| format!("{}.receipt", job.result_upload_url));
     let res_receipt = client
         .put(&receipt_url)
         .body(encrypted_receipt)
@@ -1025,7 +1031,7 @@ fn handle_job(
         eprintln!("Warning: receipt upload failed: {}", res_receipt.status());
     }
 
-    Ok(job.result_upload_url.clone())
+    Ok(job.result_url.clone().unwrap_or_else(|| job.result_upload_url.clone()))
 }
 
 // ─── Networking ────────────────────────────────────────────────────────────
