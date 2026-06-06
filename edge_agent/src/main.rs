@@ -713,6 +713,25 @@ fn luks_preflight() -> Result<()> {
     Ok(())
 }
 
+fn create_job_tempdir() -> Result<tempfile::TempDir> {
+    let base_dir = env::var("TENXO_WORK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/lib/tenxo/workspaces"));
+
+    match fs::create_dir_all(&base_dir) {
+        Ok(()) => tempfile::tempdir_in(&base_dir)
+            .with_context(|| format!("failed to create temp workspace under {}", base_dir.display())),
+        Err(err) => {
+            eprintln!(
+                "Warning: could not create {}; falling back to system temp dir: {}",
+                base_dir.display(),
+                err
+            );
+            tempdir().context("failed to create temp workspace")
+        }
+    }
+}
+
 fn setup_luks_container(container_path: &std::path::Path, passphrase: &str, mount_point: &std::path::Path, job_id: &str) -> Result<String> {
     let container_str = container_path.to_string_lossy();
     let mapper_name = format!(
@@ -857,7 +876,7 @@ fn handle_job(
     let input_hash = hash_sha256(&plain);
 
     // ── Step 3: LUKS2 container for at-rest protection ────────────────
-    let td = tempdir().context("failed to create temp workspace")?;
+    let td = create_job_tempdir()?;
     let container_path = td.path().join("workspace.luks");
     let mount_point = td.path().join("mnt");
 
