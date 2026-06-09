@@ -41,8 +41,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::Instant;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -425,6 +424,108 @@ fn pull_docker_image(image: &str) -> Result<()> {
     Ok(())
 }
 
+fn create_docker_volume(name: &str) -> Result<()> {
+    Command::new("docker")
+        .args(["volume", "create", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context(format!("failed to create Docker volume {name}"))?;
+    Ok(())
+}
+
+fn remove_docker_volume(name: &str) -> Result<()> {
+    Command::new("docker")
+        .args(["volume", "rm", "-f", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+    Ok(())
+}
+
+/// Copy a directory into a Docker volume by piping a tar stream.
+/// The agent reads from `src` and streams into a helper container
+/// that extracts into the volume.  Never bind-mounts from paths
+/// the Docker daemon may not see (e.g. LUKS mounts, container-local tmpfs).
+fn tar_into_volume(src: &Path, volume: &str) -> Result<()> {
+    let mut helper = Command::new("docker")
+        .args([
+            "run", "--rm", "-i",
+            "-v", &format!("{}:/data", volume),
+            "alpine:latest",
+            "tar", "-C", "/data", "-xzf", "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn tar-into-volume helper")?;
+
+    let mut tar = Command::new("tar")
+        .args(["-C", &src.to_string_lossy(), "-czf", "-", "."])
+        .stdout(helper.stdin.take().unwrap())
+        .spawn()
+        .context("failed to tar workspace")?;
+
+    let status = helper.wait().context("tar-into-volume helper failed")?;
+    let _ = tar.wait();
+
+    if !status.success() {
+        return Err(anyhow!("failed to copy workspace into Docker volume {volume}"));
+    }
+    Ok(())
+}
+
+/// Extract files from a Docker volume path into a local directory via tar pipe.
+/// If the subdirectory does not exist inside the volume this is a no-op.
+fn extract_from_volume(volume: &str, volume_subdir: &str, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+
+    let check = Command::new("docker")
+        .args([
+            "run", "--rm",
+            "-v", &format!("{}:/data:ro", volume),
+            "alpine:latest",
+            "test", "-d", &format!("/data/{}", volume_subdir),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_default();
+
+    if !check.success() {
+        println!("No output directory found in Docker volume {volume} — skipping extract");
+        return Ok(());
+    }
+
+    let mut helper = Command::new("docker")
+        .args([
+            "run", "--rm",
+            "-v", &format!("{}:/data:ro", volume),
+            "alpine:latest",
+            "tar", "-C", &format!("/data/{}", volume_subdir), "-czf", "-", ".",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn volume-extract helper")?;
+
+    let mut extract = Command::new("tar")
+        .args(["-C", &dst.to_string_lossy(), "-xzf", "-"])
+        .stdin(helper.stdout.take().unwrap())
+        .spawn()
+        .context("failed to spawn tar extract")?;
+
+    let status = helper.wait().context("volume-extract helper failed")?;
+    let _ = extract.wait();
+
+    if !status.success() {
+        return Err(anyhow!("failed to extract output from Docker volume {volume}"));
+    }
+    Ok(())
+}
+
 fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, job_id: &str) -> Result<()> {
     let (image, cmd) = build_docker_config(job_type, config);
     let runtime = get_container_runtime();
@@ -435,22 +536,18 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
 
     pull_docker_image(&image)?;
 
-    let output_dir = workspace.join("output");
-    fs::create_dir_all(&output_dir)
-    .context("failed to create output directory")?;
+    // ── Docker volumes (avoid bind-mount from LUKS path) ─────────────
+    let volume = format!("tenxo-ws-{}", job_id);
+    create_docker_volume(&volume)?;
 
-    let work_dir = workspace.to_string_lossy().to_string();
-    // Mount the LUKS-backed workspace once. A read-only /workspace plus a nested
-    // /workspace/output bind mount fails on some Docker/runc setups because the
-    // nested mountpoint is created under the read-only parent during init.
-    let mount_workspace = format!("{}:/workspace:rw", work_dir);
+    // Copy workspace into volume via tar pipe (LUKS path → agent → Docker)
+    tar_into_volume(workspace, &volume)?;
 
     let mut docker_args: Vec<String> = vec!["run".to_string()];
 
     match runtime {
         RuntimeKind::Kata => {
             docker_args.push("--runtime=io.containerd.kata.v2".to_string());
-            // Kata does not support --gpus all; pass NVIDIA GPUs as PCI devices
             let pci_devices = detect_nvidia_pci_devices();
             if !pci_devices.is_empty() {
                 for pci_id in &pci_devices {
@@ -480,7 +577,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     docker_args.push("--cap-drop".to_string());
     docker_args.push("ALL".to_string());
     docker_args.push("-v".to_string());
-    docker_args.push(mount_workspace);
+    docker_args.push(format!("{}:/workspace", volume));
     docker_args.push("-w".to_string());
     docker_args.push("/workspace".to_string());
     docker_args.push("-e".to_string());
@@ -507,7 +604,7 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
     }
 
     println!("Running Docker command: docker {}", docker_args.join(" "));
-    println!("Running job with runtime {:?}", runtime);
+    println!("Running job with runtime {:?}, volume {} timeout {}s", runtime, volume, timeout_secs);
 
     let mut child = Command::new("docker")
         .args(&docker_args)
@@ -516,37 +613,12 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
         .spawn()
         .context("failed to spawn docker")?;
 
-    // 10-minute timeout — Docker build/pull + execution
-    let max_wait = Duration::from_secs(600);
-    let start = Instant::now();
-
+    let started = std::time::Instant::now();
     let output = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let out = match child.wait_with_output() {
-                    Ok(out) => out,
-                    Err(e) => {
-                        eprintln!("warning: failed to read docker output: {}", e);
-                        Output { status, stdout: vec![], stderr: vec![] }
-                    }
-                };
-                break out;
-            }
-            Ok(None) => {
-                if start.elapsed() > max_wait {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(anyhow!("docker execution timed out after 600s"));
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(anyhow!("docker process error: {}", e));
-            }
+        if child.try_wait()?.is_some() {
+            break child.wait_with_output().context("failed to collect docker output")?;
         }
-        if start.elapsed() > Duration::from_secs(timeout_secs) {
+        if started.elapsed() > Duration::from_secs(timeout_secs) {
             let _ = child.kill();
             let output = child
                 .wait_with_output()
@@ -563,17 +635,28 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
         std::thread::sleep(Duration::from_secs(1));
     };
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        println!("Docker stdout: {}", stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("Docker stderr: {}", stderr.trim());
+    }
+
+    // Copy output back from Docker volume into LUKS workspace
+    extract_from_volume(&volume, "output", &workspace.join("output"))?;
+
+    // Clean up
+    let _ = remove_docker_volume(&volume);
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        eprintln!("Docker stdout:\n{}", stdout);
-        eprintln!("Docker stderr:\n{}", stderr);
         return Err(anyhow!(
-        "docker exited with code {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        stdout,
-        stderr
-    ));
+            "docker exited with {:?}. stdout={} stderr={}",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        ));
     }
 
     Ok(())
@@ -591,8 +674,8 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
                 let cmd = format!(
-            "ls -la /workspace && if [ -f requirements.txt ]; then pip install -r requirements.txt -q; fi; python {}",
-            script
+            "set -e; ls -la /workspace; if [ -f requirements.txt ]; then echo 'Installing dependencies...' && pip install -r requirements.txt; fi; echo '=== Running {} ===' && python {} && echo '=== Done ===' && echo 'Output directory: /workspace/output/' && ls -la /workspace/output/ 2>/dev/null || echo 'WARNING: /workspace/output/ not found — script did not produce output'",
+            script, script
         );
 
         (image.into(), vec!["bash".into(), "-c".into(), cmd])
@@ -652,6 +735,14 @@ fn create_luks_passphrase() -> Result<String> {
     let mut buf = [0u8; 32];
     OsRng.fill_bytes(&mut buf);
     Ok(hex::encode(buf))
+}
+
+/// Drop guard that stops the heartbeat thread when run_agent exits.
+struct HbGuard(Arc<AtomicBool>);
+impl Drop for HbGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
@@ -965,8 +1056,29 @@ fn handle_job(
 
     if !zip_cmd.status.success() {
         fs::create_dir_all(&output_dir)?;
+
+        // Collect workspace listing for debugging
+        let mut workspace_contents = String::new();
+        let listing = Command::new("ls")
+            .arg("-laR")
+            .arg(&workspace)
+            .output()
+            .ok();
+        if let Some(l) = listing {
+            workspace_contents = String::from_utf8_lossy(&l.stdout).to_string();
+        }
+        let debug_info = format!(
+            "Job executed successfully but no output was found in /workspace/output/\n\
+             Make sure your script writes results to the 'output' subdirectory.\n\n\
+             ==================== Workspace contents ====================\n\
+             {workspace_contents}\n\
+             ===========================================================\n\
+             Your script: {script_name}\n\
+             Working dir: /workspace\n\
+             Output dir:  /workspace/output/"
+        );
         let placeholder = output_dir.join("result.txt");
-        fs::write(&placeholder, "Tenxo job completed successfully")?;
+        fs::write(&placeholder, &debug_info)?;
         Command::new("zip")
             .arg("-r")
             .arg(&result_zip_path)
@@ -1142,29 +1254,6 @@ fn main() -> Result<()> {
         .build()
         .context("failed to create HTTP client")?;
 
-    // ── Spawn heartbeat publisher (HTTP POST, runs across reconnects) ──
-    let hb_client = client.clone();
-    let hb_url = format!("{}/agent/heartbeat", matchmaker_url);
-    let hb_node = node_id.clone();
-    let hb_owner = owner.clone();
-    let hb_gpu_model = gpu_model.clone();
-    let hb_gpu_vram = gpu_vram_mb;
-    let hb_shutdown = shutdown.clone();
-    std::thread::spawn(move || {
-        while !hb_shutdown.load(Ordering::SeqCst) {
-            let hb = serde_json::json!({
-                "node_id": hb_node,
-                "status": "idle",
-                "owner": hb_owner,
-                "gpu_model": hb_gpu_model,
-                "gpu_vram_mb": hb_gpu_vram,
-                "tee_attested": true,
-            });
-            let _ = hb_client.post(&hb_url).json(&hb).send();
-            std::thread::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-        }
-    });
-
     // ── Retry loop: reconnect on WS drop ──────────────────────────────
     let mut backoff: u64 = 1;
     while !shutdown.load(Ordering::SeqCst) {
@@ -1229,6 +1318,35 @@ fn run_agent(
     });
     ws.send(Message::Text(serde_json::to_string(&reg_msg)?))?;
 
+    // ── Heartbeat thread: only active while WS is connected ─────────
+    let hb_shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let hb_shutdown = hb_shutdown.clone();
+        let hb_url = format!("{}/agent/heartbeat", matchmaker_url);
+        let hb_client = client.clone();
+        let hb_node = node_id.to_string();
+        let hb_owner = owner.to_string();
+        let hb_gpu_model = gpu_model.to_string();
+        let hb_gpu_vram = gpu_vram_mb;
+        std::thread::spawn(move || {
+            while !hb_shutdown.load(Ordering::SeqCst) {
+                let hb = serde_json::json!({
+                    "node_id": hb_node,
+                    "status": "idle",
+                    "owner": hb_owner,
+                    "gpu_model": hb_gpu_model,
+                    "gpu_vram_mb": hb_gpu_vram,
+                    "tee_attested": true,
+                });
+                let _ = hb_client.post(&hb_url).json(&hb).send();
+                std::thread::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            }
+        });
+    }
+
+    // Ensure heartbeat stops when run_agent exits
+    let _heartbeat_guard = HbGuard(hb_shutdown.clone());
+
     while !shutdown.load(Ordering::SeqCst) {
         let msg = match ws.read() {
             Ok(m) => m,
@@ -1283,6 +1401,13 @@ fn run_agent(
                             final_key[i] = aes_key[i] ^ shared_secret[i];
                         }
                         println!("AES key derived via HKDF and XOR-blinded for job {}", current_job_id);
+                        let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
+                            "type": "result",
+                            "payload": {
+                                "job_id": current_job_id,
+                                "status": "running",
+                            }
+                        })).unwrap()));
                         handle_job(client, &payload, &final_key)
                     }
                     None => {
@@ -1310,6 +1435,13 @@ fn run_agent(
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
                         aes_key.copy_from_slice(&key_bytes);
+                        let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
+                            "type": "result",
+                            "payload": {
+                                "job_id": current_job_id,
+                                "status": "running",
+                            }
+                        })).unwrap()));
                         handle_job(client, &payload, &aes_key)
                     }
                 };
