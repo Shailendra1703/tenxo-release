@@ -1338,7 +1338,10 @@ fn run_agent(
                     "gpu_vram_mb": hb_gpu_vram,
                     "tee_attested": true,
                 });
-                let _ = hb_client.post(&hb_url).json(&hb).send();
+                match hb_client.post(&hb_url).json(&hb).send() {
+                    Ok(_) => println!("Heartbeat sent to {}", hb_url),
+                    Err(e) => eprintln!("Heartbeat POST failed: {}", e),
+                }
                 std::thread::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
             }
         });
