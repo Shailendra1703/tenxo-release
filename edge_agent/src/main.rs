@@ -1338,10 +1338,7 @@ fn run_agent(
                     "gpu_vram_mb": hb_gpu_vram,
                     "tee_attested": true,
                 });
-                match hb_client.post(&hb_url).json(&hb).send() {
-                    Ok(_) => println!("Heartbeat sent to {}", hb_url),
-                    Err(e) => eprintln!("Heartbeat POST failed: {}", e),
-                }
+                let _ = hb_client.post(&hb_url).json(&hb).send();
                 std::thread::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
             }
         });
@@ -1404,13 +1401,6 @@ fn run_agent(
                             final_key[i] = aes_key[i] ^ shared_secret[i];
                         }
                         println!("AES key derived via HKDF and XOR-blinded for job {}", current_job_id);
-                        let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
-                            "type": "result",
-                            "payload": {
-                                "job_id": current_job_id,
-                                "status": "running",
-                            }
-                        })).unwrap()));
                         handle_job(client, &payload, &final_key)
                     }
                     None => {
@@ -1438,13 +1428,6 @@ fn run_agent(
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
                         aes_key.copy_from_slice(&key_bytes);
-                        let _ = ws.send(Message::Text(serde_json::to_string(&serde_json::json!({
-                            "type": "result",
-                            "payload": {
-                                "job_id": current_job_id,
-                                "status": "running",
-                            }
-                        })).unwrap()));
                         handle_job(client, &payload, &aes_key)
                     }
                 };
