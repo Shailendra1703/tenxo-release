@@ -699,7 +699,7 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
                 let cmd = format!(
-            "set -e; ls -la /workspace; if [ -f requirements.txt ]; then echo 'Installing dependencies...' && pip install -r requirements.txt; fi; echo '=== Running {} ===' && python {} && echo '=== Done ===' && echo 'Output directory: /workspace/output/' && ls -la /workspace/output/ 2>/dev/null || echo 'WARNING: /workspace/output/ not found — script did not produce output'",
+            "set -e; ls -la /workspace; (command -v curl >/dev/null 2>&1 && command -v wget >/dev/null 2>&1) || (apt-get update -qq && apt-get install -y -qq curl wget ca-certificates) 2>/dev/null || (apk add --no-cache curl wget ca-certificates) 2>/dev/null || true; if [ -f requirements.txt ]; then echo 'Installing dependencies...' && pip install -r requirements.txt; fi; echo '=== Running {} ==='; python {}; exit_code=$?; echo '=== Done ==='; exit $exit_code",
             script, script
         );
 
