@@ -24,3 +24,4 @@ tungstenite = { version = "0.21", default-features = false, features = ["handsha
 ctrlc = "3.4"
 hex = "0.4"
 walkdir = "2"
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
