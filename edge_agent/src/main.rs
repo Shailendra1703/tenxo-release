@@ -31,6 +31,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, KeyInit};
 use base64::Engine;
 use base64::engine::general_purpose;
+use ed25519_dalek::{SigningKey, Signer};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use reqwest::blocking::Client;
@@ -44,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 use tungstenite::{Message, WebSocket};
 use tungstenite::stream::MaybeTlsStream;
@@ -699,7 +700,7 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
                 let cmd = format!(
-            "set -e; ls -la /workspace; (command -v curl >/dev/null 2>&1 && command -v wget >/dev/null 2>&1) || (apt-get update -qq && apt-get install -y -qq curl wget ca-certificates) 2>/dev/null || (conda install -y -c conda-forge curl wget ca-certificates) 2>/dev/null || (apk add --no-cache curl wget ca-certificates) 2>/dev/null || true; if [ -f requirements.txt ]; then echo 'Installing dependencies...' && pip install -r requirements.txt; fi; echo '=== Running {} ==='; python {}; exit_code=$?; echo '=== Done ==='; exit $exit_code",
+            "set -e; ls -la /workspace; (command -v curl >/dev/null 2>&1 && command -v wget >/dev/null 2>&1) || (apt-get update -qq && apt-get install -y -qq curl wget ca-certificates) 2>/dev/null || (conda install -y -c conda-forge curl wget ca-certificates) 2>/dev/null || (apk add --no-cache curl wget ca-certificates) 2>/dev/null || true; if [ -f requirements.txt ]; then echo 'Installing dependencies...' && pip install -r requirements.txt; fi; echo '=== Running {} ==='; python3 {}; exit_code=$?; echo '=== Done ==='; exit $exit_code",
             script, script
         );
 
@@ -1189,11 +1190,13 @@ fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-// ─── Agent Config (persistent across restarts) ──────────────────────────────
+// ─── Agent Identity (persistent ed25519 keypair across restarts) ────────────
 
 #[derive(Serialize, Deserialize)]
 struct AgentConfig {
     node_id: String,
+    secret_key: String, // base64-encoded ed25519 seed (32 bytes)
+    public_key: String, // base64-encoded ed25519 verifying key (32 bytes)
 }
 
 fn config_dir() -> String {
@@ -1225,26 +1228,38 @@ fn save_config(cfg: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-fn resolve_node_id() -> Result<String> {
-    // 1. Env var takes highest priority (for testing / explicit override)
-    if let Ok(nid) = env::var("NODE_ID") {
-        if !nid.is_empty() {
-            println!("Using NODE_ID from environment");
-            return Ok(nid);
-        }
-    }
-    // 2. Try loading from persistent config
+fn resolve_identity() -> Result<(String, SigningKey)> {
+    let env_override = env::var("NODE_ID").ok().filter(|s| !s.is_empty());
+
     if let Some(cfg) = load_config() {
-        println!("Using node_id from config: {}", cfg.node_id);
-        return Ok(cfg.node_id);
+        let id = env_override.unwrap_or(cfg.node_id);
+        let sk_bytes: [u8; 32] = general_purpose::STANDARD
+            .decode(&cfg.secret_key)
+            .context("bad secret_key encoding")?
+            .try_into()
+            .map_err(|_| anyhow!("secret_key must be 32 bytes"))?;
+        let sk = SigningKey::from_bytes(&sk_bytes);
+        println!("Loaded identity: {} (pubkey: {}...)", id, &cfg.public_key[..16]);
+        return Ok((id, sk));
     }
-    // 3. Generate a new one and persist (best-effort)
-    let node_id = format!("node-{}", Uuid::new_v4());
-    match save_config(&AgentConfig { node_id: node_id.clone() }) {
-        Ok(_) => println!("Generated and saved new node_id: {}", node_id),
-        Err(e) => eprintln!("Warning: could not persist node_id config: {}", e),
-    }
-    Ok(node_id)
+
+    let mut seed = [0u8; 32];
+    use rand::RngCore;
+    OsRng.fill_bytes(&mut seed);
+    let signing_key = SigningKey::from_bytes(&seed);
+    let verifying_key = signing_key.verifying_key();
+    let node_id = env_override.unwrap_or_else(|| format!("node-{}", Uuid::new_v4()));
+    let pubkey_b64 = general_purpose::STANDARD.encode(verifying_key.to_bytes());
+    let sk_b64 = general_purpose::STANDARD.encode(signing_key.to_bytes());
+
+    let cfg = AgentConfig {
+        node_id: node_id.clone(),
+        secret_key: sk_b64,
+        public_key: pubkey_b64.clone(),
+    };
+    save_config(&cfg)?;
+    println!("Generated new identity: {} (pubkey: {}...)", node_id, &pubkey_b64[..16]);
+    Ok((node_id, signing_key))
 }
 
 // ─── Main Entry Point ──────────────────────────────────────────────────────
@@ -1252,7 +1267,9 @@ fn resolve_node_id() -> Result<String> {
 fn main() -> Result<()> {
     let matchmaker_url =
         env::var("MATCHMAKER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let node_id = resolve_node_id()?;
+    let (node_id, signing_key) = resolve_identity()?;
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_b64 = general_purpose::STANDARD.encode(verifying_key.to_bytes());
     let owner = env::var("OWNER").unwrap_or_else(|_| String::new());
 
     let (gpu_model, gpu_vram_mb) = query_gpu_info();
@@ -1273,6 +1290,7 @@ fn main() -> Result<()> {
 
     // ── Phase 1: Registration (heartbeat — independent of WebSocket) ──
     // Node appears as "idle" in marketplace from agent start.
+    // Heartbeat includes ed25519 signature for cryptographic provider identity.
     // Heartbeat survives WS reconnects and shuts down only on SIGINT.
     {
         let hb_client = client.clone();
@@ -1280,9 +1298,17 @@ fn main() -> Result<()> {
         let hb_node = node_id.clone();
         let hb_owner = owner.clone();
         let hb_gpu_model = gpu_model.clone();
+        let hb_pubkey = pubkey_b64.clone();
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
             while !shutdown.load(Ordering::SeqCst) {
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let msg = format!("heartbeat:{}:{}", hb_node, ts);
+                let sig = signing_key.sign(msg.as_bytes());
+                let sig_b64 = general_purpose::STANDARD.encode(sig.to_bytes());
                 let hb = serde_json::json!({
                     "node_id": hb_node,
                     "status": "idle",
@@ -1290,6 +1316,9 @@ fn main() -> Result<()> {
                     "gpu_model": hb_gpu_model,
                     "gpu_vram_mb": gpu_vram_mb,
                     "tee_attested": true,
+                    "pubkey": hb_pubkey,
+                    "timestamp": ts,
+                    "signature": sig_b64,
                 });
                 if let Err(e) = hb_client.post(&hb_url).json(&hb).send() {
                     eprintln!("heartbeat: HTTP POST to {} failed: {}", hb_url, e);
