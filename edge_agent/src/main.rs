@@ -1320,8 +1320,26 @@ fn main() -> Result<()> {
                     "timestamp": ts,
                     "signature": sig_b64,
                 });
-                if let Err(e) = hb_client.post(&hb_url).json(&hb).send() {
-                    eprintln!("heartbeat: HTTP POST to {} failed: {}", hb_url, e);
+                let max_retries = 3;
+                let mut hb_ok = false;
+                for attempt in 0..max_retries {
+                    match hb_client.post(&hb_url).json(&hb).send() {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            if status.is_success() {
+                                hb_ok = true;
+                                break;
+                            }
+                            eprintln!("heartbeat: {} returned {} (attempt {}/{})", hb_url, status, attempt + 1, max_retries);
+                        }
+                        Err(e) => {
+                            eprintln!("heartbeat: POST to {} failed (attempt {}/{}): {}", hb_url, attempt + 1, max_retries, e);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+                if !hb_ok {
+                    eprintln!("heartbeat: all {} attempts failed for {}", max_retries, hb_url);
                 }
                 for _ in 0..HEARTBEAT_INTERVAL_SECS {
                     if shutdown.load(Ordering::SeqCst) { break; }
