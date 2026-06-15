@@ -114,7 +114,7 @@ fn query_gpu_info() -> (String, i32) {
 
 // ─── Data Structures ────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct JobMsg {
     job_id: Option<String>,
     #[serde(alias = "encrypted_job_url")]
@@ -757,8 +757,22 @@ fn build_docker_config(job_type: &str, config: &serde_json::Value) -> (String, V
                 .and_then(|v| v.as_str())
                 .unwrap_or("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime");
                 let cmd = format!(
-            "set -e; ls -la /workspace; (command -v curl >/dev/null 2>&1 && command -v wget >/dev/null 2>&1) || (apt-get update -qq && apt-get install -y -qq curl wget ca-certificates) 2>/dev/null || (conda install -y -c conda-forge curl wget ca-certificates) 2>/dev/null || (apk add --no-cache curl wget ca-certificates) 2>/dev/null || true; if [ -f requirements.txt ]; then echo 'Installing dependencies...' && pip install -r requirements.txt; fi; echo '=== Running {} ==='; python3 {}; exit_code=$?; echo '=== Done ==='; exit $exit_code",
-            script, script
+            "set -euo pipefail; \
+             if ! command -v curl >/dev/null 2>&1; then \
+               echo 'Installing curl...'; \
+               if command -v apt-get >/dev/null 2>&1; then \
+                 apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates; \
+               elif command -v conda >/dev/null 2>&1; then \
+                 conda install -y -c conda-forge curl ca-certificates; \
+               elif command -v apk >/dev/null 2>&1; then \
+                 apk add --no-cache curl ca-certificates; \
+               else \
+                 echo 'ERROR: curl is required but no supported package manager was found' >&2; exit 1; \
+               fi; \
+             fi; \
+             if [ -f requirements.txt ]; then echo 'Installing dependencies...' && pip install -r requirements.txt; fi; \
+             echo '=== Running {script} ==='; python3 {script}",
+            script = script
         );
 
         (image.into(), vec!["bash".into(), "-c".into(), cmd])
@@ -1215,6 +1229,79 @@ fn send_error(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, job_id: &str, msg: 
     })).unwrap()));
 }
 
+fn report_job_result_http(
+    client: &Client,
+    matchmaker_url: &str,
+    signing_key: &SigningKey,
+    node_id: &str,
+    job_id: &str,
+    status: &str,
+    result_url: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let msg = format!("job-result:{}:{}:{}:{}", node_id, job_id, status, ts);
+    let sig = signing_key.sign(msg.as_bytes());
+    let sig_b64 = general_purpose::STANDARD.encode(sig.to_bytes());
+
+    let mut body = serde_json::json!({
+        "node_id": node_id,
+        "job_id": job_id,
+        "status": status,
+        "timestamp": ts,
+        "signature": sig_b64,
+    });
+    if let Some(url) = result_url {
+        body["result_url"] = serde_json::Value::String(url.into());
+    }
+    if let Some(err) = error {
+        body["error"] = serde_json::Value::String(err.into());
+    }
+
+    let url = format!("{}/agent/job-result", matchmaker_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .context("failed to POST job result")?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().unwrap_or_default();
+        return Err(anyhow!("job result report returned {}: {}", code, text.trim()));
+    }
+    println!("Job {} result reported via HTTP (status={})", job_id, status);
+    Ok(())
+}
+
+fn try_send_ws_result(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    job_id: &str,
+    status: &str,
+    result_url: Option<&str>,
+    error: Option<&str>,
+) {
+    let mut payload = serde_json::json!({
+        "job_id": job_id,
+        "status": status,
+    });
+    if let Some(url) = result_url {
+        payload["result_url"] = serde_json::Value::String(url.into());
+    }
+    if let Some(err) = error {
+        payload["error"] = serde_json::Value::String(err.into());
+    }
+    let reply = serde_json::json!({
+        "type": "result",
+        "payload": payload,
+    });
+    if let Err(e) = ws.send(Message::Text(serde_json::to_string(&reply).unwrap())) {
+        eprintln!("WS result send failed for job {} (HTTP report is authoritative): {}", job_id, e);
+    }
+}
+
 fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
     let res = client
         .get(url)
@@ -1337,6 +1424,7 @@ fn main() -> Result<()> {
         let hb_owner = owner.clone();
         let hb_gpu_model = gpu_model.clone();
         let hb_pubkey = pubkey_b64.clone();
+        let hb_signing_key = signing_key.clone();
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
             while !shutdown.load(Ordering::SeqCst) {
@@ -1345,7 +1433,7 @@ fn main() -> Result<()> {
                     .unwrap_or_default()
                     .as_secs();
                 let msg = format!("heartbeat:{}:{}", hb_node, ts);
-                let sig = signing_key.sign(msg.as_bytes());
+                let sig = hb_signing_key.sign(msg.as_bytes());
                 let sig_b64 = general_purpose::STANDARD.encode(sig.to_bytes());
                 let hb = serde_json::json!({
                     "node_id": hb_node,
@@ -1395,7 +1483,7 @@ fn main() -> Result<()> {
         println!("  Matchmaker: {}", matchmaker_url);
         println!("  Owner:      {}", if owner.is_empty() { "(none)" } else { &owner });
 
-        match run_agent(&matchmaker_url, &node_id, &owner, &gpu_model, gpu_vram_mb, &client, &shutdown) {
+        match run_agent(&matchmaker_url, &node_id, &owner, &gpu_model, gpu_vram_mb, &signing_key, &client, &shutdown) {
             Ok(_) => {
                 println!("Agent session ended normally");
                 break;
@@ -1420,12 +1508,20 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+struct JobCompletion {
+    job_id: String,
+    status: String,
+    result_url: Option<String>,
+    error: Option<String>,
+}
+
 fn run_agent(
     matchmaker_url: &str,
     node_id: &str,
     owner: &str,
     gpu_model: &str,
     gpu_vram_mb: i32,
+    signing_key: &SigningKey,
     client: &Client,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -1451,8 +1547,19 @@ fn run_agent(
     });
     ws.send(Message::Text(serde_json::to_string(&reg_msg)?))?;
 
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<JobCompletion>();
 
     while !shutdown.load(Ordering::SeqCst) {
+        while let Ok(done) = result_rx.try_recv() {
+            try_send_ws_result(
+                &mut ws,
+                &done.job_id,
+                &done.status,
+                done.result_url.as_deref(),
+                done.error.as_deref(),
+            );
+        }
+
         let msg = match ws.read() {
             Ok(m) => m,
             Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1482,13 +1589,17 @@ fn run_agent(
 
                 let current_job_id = payload.job_id.clone().unwrap_or_default();
 
-                let result = match &payload.salt_b64 {
+                let final_key = match &payload.salt_b64 {
                     Some(s) => {
                         let salt = match general_purpose::STANDARD.decode(s) {
                             Ok(salt) => salt,
                             Err(e) => {
                                 let err = format!("failed to decode salt: {}", e);
                                 eprintln!("{}", err);
+                                let _ = report_job_result_http(
+                                    client, matchmaker_url, signing_key, node_id,
+                                    &current_job_id, "error", None, Some(&err),
+                                );
                                 send_error(&mut ws, &current_job_id, &err);
                                 continue;
                             }
@@ -1496,24 +1607,32 @@ fn run_agent(
                         if salt.len() != SALT_SIZE {
                             let err = format!("invalid salt length: {} (expected {})", salt.len(), SALT_SIZE);
                             eprintln!("{}", err);
+                            let _ = report_job_result_http(
+                                client, matchmaker_url, signing_key, node_id,
+                                &current_job_id, "error", None, Some(&err),
+                            );
                             send_error(&mut ws, &current_job_id, &err);
                             continue;
                         }
                         let mut aes_key = [0u8; AEAD_KEY_SIZE];
                         aes_key.copy_from_slice(&derive_aes_key(&shared_secret, &salt));
-                        let mut final_key = [0u8; AEAD_KEY_SIZE];
+                        let mut key = [0u8; AEAD_KEY_SIZE];
                         for i in 0..AEAD_KEY_SIZE {
-                            final_key[i] = aes_key[i] ^ shared_secret[i];
+                            key[i] = aes_key[i] ^ shared_secret[i];
                         }
                         println!("AES key derived via HKDF and XOR-blinded for job {}", current_job_id);
-                        handle_job(client, &payload, &final_key)
+                        key
                     }
                     None => {
                         let key_b64 = payload.enc_key_b64.as_deref().unwrap_or("");
                         if key_b64.is_empty() {
                             let err = "no enc_key_b64 or salt_b64 in job message";
                             eprintln!("{}", err);
-                            send_error(&mut ws, &current_job_id, &err);
+                            let _ = report_job_result_http(
+                                client, matchmaker_url, signing_key, node_id,
+                                &current_job_id, "error", None, Some(err),
+                            );
+                            send_error(&mut ws, &current_job_id, err);
                             continue;
                         }
                         let key_bytes = match general_purpose::STANDARD.decode(key_b64) {
@@ -1521,6 +1640,10 @@ fn run_agent(
                             Err(e) => {
                                 let err = format!("failed to decode enc_key_b64: {}", e);
                                 eprintln!("{}", err);
+                                let _ = report_job_result_http(
+                                    client, matchmaker_url, signing_key, node_id,
+                                    &current_job_id, "error", None, Some(&err),
+                                );
                                 send_error(&mut ws, &current_job_id, &err);
                                 continue;
                             }
@@ -1528,40 +1651,74 @@ fn run_agent(
                         if key_bytes.len() != AEAD_KEY_SIZE {
                             let err = format!("invalid key length: {}", key_bytes.len());
                             eprintln!("{}", err);
+                            let _ = report_job_result_http(
+                                client, matchmaker_url, signing_key, node_id,
+                                &current_job_id, "error", None, Some(&err),
+                            );
                             send_error(&mut ws, &current_job_id, &err);
                             continue;
                         }
-                        let mut aes_key = [0u8; AEAD_KEY_SIZE];
-                        aes_key.copy_from_slice(&key_bytes);
-                        handle_job(client, &payload, &aes_key)
+                        let mut key = [0u8; AEAD_KEY_SIZE];
+                        key.copy_from_slice(&key_bytes);
+                        key
                     }
                 };
 
-                let reply = match result {
-                    Ok(result_url) => {
-                        println!("Job {} completed successfully", current_job_id);
-                        serde_json::json!({
-                            "type": "result",
-                            "payload": {
-                                "job_id": current_job_id,
-                                "status": "done",
-                                "result_url": result_url,
+                // Run job in background so the WS bridge stays responsive for
+                // keepalives. Results are reported via signed HTTP POST (reliable)
+                // with a best-effort WS notification afterward.
+                let job_client = client.clone();
+                let job_matchmaker = matchmaker_url.to_string();
+                let job_node = node_id.to_string();
+                let job_signing_key = signing_key.clone();
+                let job_id_bg = current_job_id.clone();
+                let job_payload = payload.clone();
+                let job_result_tx = result_tx.clone();
+                std::thread::spawn(move || {
+                    let result = handle_job(&job_client, &job_payload, &final_key);
+                    let completion = match result {
+                        Ok(result_url) => {
+                            println!("Job {} completed successfully", job_id_bg);
+                            let _ = report_job_result_http(
+                                &job_client,
+                                &job_matchmaker,
+                                &job_signing_key,
+                                &job_node,
+                                &job_id_bg,
+                                "done",
+                                Some(&result_url),
+                                None,
+                            );
+                            JobCompletion {
+                                job_id: job_id_bg.clone(),
+                                status: "done".into(),
+                                result_url: Some(result_url),
+                                error: None,
                             }
-                        })
-                    }
-                    Err(e) => {
-                        eprintln!("Job failed: {}", e);
-                        serde_json::json!({
-                            "type": "result",
-                            "payload": {
-                                "job_id": current_job_id,
-                                "status": "error",
-                                "error": format!("{}", e),
+                        }
+                        Err(e) => {
+                            let err = format!("{}", e);
+                            eprintln!("Job {} failed: {}", job_id_bg, err);
+                            let _ = report_job_result_http(
+                                &job_client,
+                                &job_matchmaker,
+                                &job_signing_key,
+                                &job_node,
+                                &job_id_bg,
+                                "error",
+                                None,
+                                Some(&err),
+                            );
+                            JobCompletion {
+                                job_id: job_id_bg.clone(),
+                                status: "error".into(),
+                                result_url: None,
+                                error: Some(err),
                             }
-                        })
-                    }
-                };
-                let _ = ws.send(Message::Text(serde_json::to_string(&reply).unwrap()));
+                        }
+                    };
+                    let _ = job_result_tx.send(completion);
+                });
             }
             Message::Close(_) => {
                 println!("WebSocket bridge closed by server");
