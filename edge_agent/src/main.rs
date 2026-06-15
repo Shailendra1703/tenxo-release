@@ -61,7 +61,7 @@ const AEAD_KEY_SIZE: usize = 32;
 const SALT_SIZE: usize = 32;
 const PADDING_TRAILER_SIZE: usize = 8;
 const HEARTBEAT_INTERVAL_SECS: u64 = 20;
-const DEFAULT_DOCKER_TIMEOUT_SECS: u64 = 540;
+const DEFAULT_DOCKER_TIMEOUT_SECS: u64 = 1800;
 
 // ─── GPU Detection ──────────────────────────────────────────────────────────
 
@@ -503,6 +503,42 @@ fn tar_into_volume(src: &Path, volume: &str) -> Result<()> {
     Ok(())
 }
 
+/// List files inside a Docker volume subdirectory (for diagnostics).
+fn list_volume_dir(volume: &str, volume_subdir: &str) -> String {
+    let out = Command::new("docker")
+        .args([
+            "run", "--rm",
+            "-v", &format!("{}:/data:ro", volume),
+            "alpine:latest",
+            "sh", "-c",
+            &format!(
+                "if [ -d /data/{volume_subdir} ]; then ls -laR /data/{volume_subdir}; else echo '(directory missing)'; fi"
+            ),
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => format!(
+            "ls failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => format!("ls error: {e}"),
+    }
+}
+
+/// Return true if `dir` contains at least one file (recursively).
+fn output_dir_has_files(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract files from a Docker volume path into a local directory via tar pipe.
 /// If the subdirectory does not exist inside the volume this is a no-op.
 fn extract_from_volume(volume: &str, volume_subdir: &str, dst: &Path) -> Result<()> {
@@ -521,7 +557,11 @@ fn extract_from_volume(volume: &str, volume_subdir: &str, dst: &Path) -> Result<
         .unwrap_or_default();
 
     if !check.success() {
-        println!("No output directory found in Docker volume {volume} — skipping extract");
+        eprintln!(
+            "No output directory found in Docker volume {volume} at /data/{volume_subdir}\n\
+             Volume listing:\n{}",
+            list_volume_dir(volume, ".")
+        );
         return Ok(());
     }
 
@@ -670,13 +710,8 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
         eprintln!("Docker stderr: {}", stderr.trim());
     }
 
-    // Copy output back from Docker volume into LUKS workspace
-    extract_from_volume(&volume, "output", &workspace.join("output"))?;
-
-    // Clean up
-    let _ = remove_docker_volume(&volume);
-
     if !output.status.success() {
+        let _ = remove_docker_volume(&volume);
         return Err(anyhow!(
             "docker exited with {:?}. stdout={} stderr={}",
             output.status.code(),
@@ -684,6 +719,28 @@ fn run_docker_job(workspace: &Path, job_type: &str, config: &serde_json::Value, 
             stderr.trim()
         ));
     }
+
+    // Copy output back from Docker volume into LUKS workspace
+    let output_dst = workspace.join("output");
+    extract_from_volume(&volume, "output", &output_dst)?;
+
+    if !output_dir_has_files(&output_dst) {
+        let vol_listing = list_volume_dir(&volume, "output");
+        let _ = remove_docker_volume(&volume);
+        return Err(anyhow!(
+            "job finished but /workspace/output/ is empty — no ML artifacts were produced.\n\
+             Ensure your script writes all results to /workspace/output/ (absolute path).\n\n\
+             Docker stdout:\n{}\n\n\
+             Docker stderr:\n{}\n\n\
+             Volume output listing (before cleanup):\n{}",
+            stdout.trim(),
+            stderr.trim(),
+            vol_listing
+        ));
+    }
+
+    // Clean up
+    let _ = remove_docker_volume(&volume);
 
     Ok(())
 }
@@ -1064,46 +1121,27 @@ fn handle_job(
     let output_dir = workspace.join("output");
     let result_zip_path = td.path().join("result.zip");
 
+    if !output_dir_has_files(&output_dir) {
+        return Err(anyhow!(
+            "no output files in {:?} after job execution — script must write to /workspace/output/",
+            output_dir
+        ));
+    }
+
     let zip_cmd = Command::new("zip")
         .arg("-r")
         .arg(&result_zip_path)
         .arg(".")
         .current_dir(&output_dir)
         .output()
-        .context("failed to create result zip")?;
+        .context("failed to create result zip — ensure the 'zip' package is installed on the provider host")?;
 
     if !zip_cmd.status.success() {
-        fs::create_dir_all(&output_dir)?;
-
-        // Collect workspace listing for debugging
-        let mut workspace_contents = String::new();
-        let listing = Command::new("ls")
-            .arg("-laR")
-            .arg(&workspace)
-            .output()
-            .ok();
-        if let Some(l) = listing {
-            workspace_contents = String::from_utf8_lossy(&l.stdout).to_string();
-        }
-        let debug_info = format!(
-            "Job executed successfully but no output was found in /workspace/output/\n\
-             Make sure your script writes results to the 'output' subdirectory.\n\n\
-             ==================== Workspace contents ====================\n\
-             {workspace_contents}\n\
-             ===========================================================\n\
-             Your script: {script_name}\n\
-             Working dir: /workspace\n\
-             Output dir:  /workspace/output/"
-        );
-        let placeholder = output_dir.join("result.txt");
-        fs::write(&placeholder, &debug_info)?;
-        Command::new("zip")
-            .arg("-r")
-            .arg(&result_zip_path)
-            .arg(".")
-            .current_dir(&output_dir)
-            .output()
-            .context("failed to create fallback result zip")?;
+        let stderr = String::from_utf8_lossy(&zip_cmd.stderr);
+        return Err(anyhow!(
+            "failed to zip output directory: {}",
+            stderr.trim()
+        ));
     }
 
     let result_blob = fs::read(&result_zip_path)
