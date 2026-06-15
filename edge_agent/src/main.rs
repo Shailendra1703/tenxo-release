@@ -1127,8 +1127,7 @@ fn handle_job(
         ));
     }
 
-    run_docker_job(&workspace, job_type, &config, job_id)
-        .context("Docker execution failed")?;
+    run_docker_job(&workspace, job_type, &config, job_id)?;
     println!("Job execution complete");
 
     // ── Step 5: Package output and compute integrity hash ──────────────
@@ -1697,7 +1696,7 @@ fn run_agent(
                             }
                         }
                         Err(e) => {
-                            let err = format!("{}", e);
+                            let err = format!("{:#}", e);
                             eprintln!("Job {} failed: {}", job_id_bg, err);
                             let _ = report_job_result_http(
                                 &job_client,
